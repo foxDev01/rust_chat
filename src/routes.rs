@@ -2,14 +2,19 @@
 
 use std::path::PathBuf;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
 use serde_json::{Value, json};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 
-use crate::{state::ChatState, ws};
+use crate::{auth, state::ChatState, ws};
 
 /// Собирает корневой роутер приложения.
 ///
@@ -32,10 +37,14 @@ pub fn router(state: ChatState) -> Router {
         .with_state(state)
 }
 
-/// Роутер служебного API.
+/// Роутер служебного API и аутентификации.
 fn api_router() -> Router<ChatState> {
     Router::new()
         .route("/health", get(health))
+        .route("/register", post(auth::register))
+        .route("/login", post(auth::login))
+        .route("/me", get(auth::me))
+        .route("/logout", post(auth::logout))
         .fallback(api_not_found)
 }
 

@@ -7,11 +7,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use tracing::info;
+use uuid::Uuid;
 
-use crate::protocol::{ChatMessage, DirectMessage, DirectThread, name_key};
+use crate::auth::Account;
+use crate::protocol::{ChatMessage, DirectMessage, DirectThread, UserName, name_key};
 
 /// Тайм-аут установки соединения с базой.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,6 +64,116 @@ impl ChatDb {
     /// Закрывает все соединения пула.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Создаёт аккаунт.
+    ///
+    /// Возвращает `None`, если имя уже занято (проверка без учёта регистра
+    /// выполняется уникальным индексом `username_key`).
+    pub async fn create_account(
+        &self,
+        username: &UserName,
+        password_hash: &str,
+    ) -> Result<Option<Account>, sqlx::Error> {
+        let row = sqlx::query(
+            "INSERT INTO accounts (id, username, username_key, password_hash)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (username_key) DO NOTHING
+             RETURNING id, username",
+        )
+        .bind(Uuid::new_v4())
+        .bind(username.as_str())
+        .bind(name_key(username.as_str()))
+        .bind(password_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| Account {
+            id: row.get("id"),
+            username: row.get("username"),
+        }))
+    }
+
+    /// Ищет аккаунт по ключу имени; вместе с аккаунтом возвращается хеш пароля.
+    pub async fn find_account_by_key(
+        &self,
+        username_key: &str,
+    ) -> Result<Option<(Account, String)>, sqlx::Error> {
+        let row =
+            sqlx::query("SELECT id, username, password_hash FROM accounts WHERE username_key = $1")
+                .bind(username_key)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.map(|row| {
+            (
+                Account {
+                    id: row.get("id"),
+                    username: row.get("username"),
+                },
+                row.get("password_hash"),
+            )
+        }))
+    }
+
+    /// Сохраняет новую сессию (в базе хранится только хеш токена).
+    pub async fn create_session(
+        &self,
+        account_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, account_id, expires_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(token_hash)
+        .bind(account_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Находит владельца действующей сессии по хешу токена.
+    pub async fn find_account_by_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<Account>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT a.id, a.username
+             FROM sessions s
+             JOIN accounts a ON a.id = s.account_id
+             WHERE s.token_hash = $1 AND s.expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| Account {
+            id: row.get("id"),
+            username: row.get("username"),
+        }))
+    }
+
+    /// Удаляет сессию (выход из аккаунта).
+    pub async fn delete_session(&self, token_hash: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Удаляет истёкшие сессии, чтобы таблица не росла бесконечно.
+    pub async fn purge_expired_sessions(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sessions WHERE expires_at <= now()")
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 
     /// Сохраняет сообщение общего канала.

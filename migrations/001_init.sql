@@ -35,3 +35,24 @@ CREATE TABLE IF NOT EXISTS direct_reads (
     read_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_key, peer_key)
 );
+
+-- Аккаунты: имя для показа, ключ для поиска без учёта регистра и хеш пароля (Argon2id).
+CREATE TABLE IF NOT EXISTS accounts (
+    id            UUID PRIMARY KEY,
+    username      TEXT NOT NULL,
+    username_key  TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Сессии входа. В базе лежит только SHA-256 от токена: утечка таблицы не даёт
+-- готовых токенов, а истёкшие сессии отсекаются при проверке.
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sessions_account_id_idx
+    ON sessions (account_id);

@@ -1,14 +1,19 @@
-//! Обработка WebSocket-соединений: вход, сообщения, личные переписки и heartbeat.
+//! Обработка WebSocket-соединений: вход по токену сессии, сообщения,
+//! личные переписки и heartbeat.
 
 use axum::{
+    Json,
     extract::{
-        State,
+        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
+    http::StatusCode,
+    response::Response,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::{
     sync::{broadcast::error::RecvError, mpsc},
     time::{self, Duration},
@@ -17,6 +22,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    auth::Account,
     protocol::{ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName},
     state::{ChatState, PERSONAL_QUEUE},
 };
@@ -28,18 +34,42 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 type SocketSink = SplitSink<WebSocket, Message>;
 
-/// Точка входа для `GET /ws`: проверяет параметры апгрейда и передаёт сокет обработчику.
-pub async fn upgrade(ws: WebSocketUpgrade, State(state): State<ChatState>) -> impl IntoResponse {
-    ws.max_message_size(MAX_FRAME_SIZE)
+/// Параметры подключения: браузер не умеет задавать заголовки для WebSocket,
+/// поэтому токен сессии передаётся в строке запроса.
+#[derive(Debug, Deserialize)]
+pub struct WsQuery {
+    token: Option<String>,
+}
+
+/// Точка входа для `GET /ws?token=...`.
+///
+/// Соединение создаётся только для владельца действующей сессии; иначе
+/// браузер получает обычный HTTP 401 ещё до апгрейда.
+pub async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<ChatState>,
+    Query(query): Query<WsQuery>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let token = query
+        .token
+        .ok_or_else(|| unauthorized("Требуется вход в аккаунт"))?;
+
+    let account = state
+        .authenticate(&token)
+        .await
+        .ok_or_else(|| unauthorized("Сессия истекла, войдите снова"))?;
+
+    Ok(ws
+        .max_message_size(MAX_FRAME_SIZE)
         .max_frame_size(MAX_FRAME_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, account)))
 }
 
 /// Основной цикл одного соединения.
 ///
 /// Параллельно обрабатываются четыре источника событий: входящие кадры,
 /// общая рассылка, личная очередь и heartbeat.
-async fn handle_socket(socket: WebSocket, state: ChatState) {
+async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
     let id = Uuid::new_v4();
     let (mut sink, mut stream) = socket.split();
 
@@ -47,7 +77,39 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
     let mut events = state.subscribe();
     // Личные сообщения приходят через отдельную очередь, принадлежащую этому соединению.
     let (inbox, mut personal) = mpsc::channel::<ServerMessage>(PERSONAL_QUEUE);
-    let mut me: Option<UserName> = None;
+
+    // Имя аккаунта уже прошло проверку при регистрации, но тип нужен для состояния.
+    let Ok(name) = UserName::parse(&account.username) else {
+        let _ = send_error(&mut sink, "Некорректное имя аккаунта").await;
+        let _ = sink.close().await;
+        return;
+    };
+
+    // Один аккаунт — одно активное соединение: второе окно получит ошибку.
+    let users = match state.join(id, &name, inbox).await {
+        Ok(users) => users,
+        Err(error) => {
+            let _ = send_error(&mut sink, error.message()).await;
+            let _ = sink.close().await;
+            return;
+        }
+    };
+
+    // Приветствие, публичная история и личные переписки.
+    if !send_initial(&mut sink, &state, &name, users).await {
+        state.leave(id).await;
+        let _ = sink.close().await;
+        return;
+    }
+
+    info!(%id, %name, "user joined");
+    state.broadcast(ServerMessage::System {
+        text: format!("{name} теперь в чате"),
+        at: Utc::now(),
+    });
+    state.broadcast(ServerMessage::Users {
+        users: state.users().await,
+    });
 
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -61,7 +123,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
 
                 match message {
                     Message::Text(text) => {
-                        if !handle_text(text.as_str(), id, &mut me, &state, &inbox, &mut sink).await {
+                        if !handle_text(text.as_str(), id, &name, &state, &mut sink).await {
                             break;
                         }
                     }
@@ -87,12 +149,11 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
             // Событие общей рассылки (сообщения, системные уведомления, список участников).
             event = events.recv() => {
                 match event {
-                    Ok(event) if me.is_some() => {
+                    Ok(event) => {
                         if send_json(&mut sink, &event).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {} // пользователь ещё не вошёл — показывать нечего
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(%id, skipped, "client is too slow, events were skipped");
                     }
@@ -102,12 +163,11 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
             // Личное сообщение для этого пользователя.
             personal_message = personal.recv() => {
                 match personal_message {
-                    Some(event) if me.is_some() => {
+                    Some(event) => {
                         if send_json(&mut sink, &event).await.is_err() {
                             break;
                         }
                     }
-                    Some(_) => {} // пользователь ещё не вошёл — показывать нечего
                     None => break,
                 }
             }
@@ -120,7 +180,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
         }
     }
 
-    // Сообщаем остальным, что участник вышел (если он вообще успел войти).
+    // Сообщаем остальным, что участник вышел.
     if let Some(name) = state.leave(id).await {
         info!(%id, %name, "user left");
         state.broadcast(ServerMessage::System {
@@ -136,15 +196,50 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
     debug!(%id, "connection closed");
 }
 
+/// Отправляет приветствие, историю и личные переписки. `false` — если сокет закрылся.
+async fn send_initial(
+    sink: &mut SocketSink,
+    state: &ChatState,
+    name: &UserName,
+    users: Vec<String>,
+) -> bool {
+    let welcome = ServerMessage::Welcome {
+        you: name.to_string(),
+        users,
+    };
+    if send_json(sink, &welcome).await.is_err() {
+        return false;
+    }
+
+    let history = ServerMessage::History {
+        messages: state.history().await,
+    };
+    if send_json(sink, &history).await.is_err() {
+        return false;
+    }
+
+    // Личные переписки не входят в публичную историю: клиенту нужны
+    // они отдельно по собеседникам, со счётчиками непрочитанных.
+    let threads = state.direct_threads(name.as_str()).await;
+    if !threads.is_empty()
+        && send_json(sink, &ServerMessage::DirectHistory { threads })
+            .await
+            .is_err()
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Обрабатывает один текстовый кадр клиента.
 ///
 /// Возвращает `false`, если соединение нужно закрыть (например, не удалось отправить ответ).
 async fn handle_text(
     raw: &str,
     id: Uuid,
-    me: &mut Option<UserName>,
+    author: &UserName,
     state: &ChatState,
-    inbox: &mpsc::Sender<ServerMessage>,
     sink: &mut SocketSink,
 ) -> bool {
     // Неизвестный или битый JSON — просто ошибка протокола, соединение не рвём.
@@ -157,68 +252,7 @@ async fn handle_text(
     };
 
     match message {
-        ClientMessage::Join { name } => {
-            // Повторный вход в одном соединении запрещён.
-            if me.is_some() {
-                return send_error(sink, "Вы уже вошли в чат").await;
-            }
-
-            let name = match UserName::parse(&name) {
-                Ok(name) => name,
-                Err(reason) => return send_error(sink, reason).await,
-            };
-
-            let users = match state.join(id, &name, inbox.clone()).await {
-                Ok(users) => users,
-                Err(error) => return send_error(sink, error.message()).await,
-            };
-
-            *me = Some(name.clone());
-
-            // Приветствие: кто вы и кто сейчас онлайн.
-            let welcome = ServerMessage::Welcome {
-                you: name.to_string(),
-                users,
-            };
-            if send_json(sink, &welcome).await.is_err() {
-                return false;
-            }
-
-            // Публичная история общего канала.
-            let history = ServerMessage::History {
-                messages: state.history().await,
-            };
-            if send_json(sink, &history).await.is_err() {
-                return false;
-            }
-
-            // Личные переписки не входят в публичную историю: клиенту нужны
-            // они отдельно по собеседникам, со счётчиками непрочитанных.
-            let threads = state.direct_threads(name.as_str()).await;
-            if !threads.is_empty() {
-                let restored = ServerMessage::DirectHistory { threads };
-                if send_json(sink, &restored).await.is_err() {
-                    return false;
-                }
-            }
-
-            info!(%id, %name, "user joined");
-            state.broadcast(ServerMessage::System {
-                text: format!("{name} теперь в чате"),
-                at: Utc::now(),
-            });
-            state.broadcast(ServerMessage::Users {
-                users: state.users().await,
-            });
-
-            true
-        }
         ClientMessage::Message { text } => {
-            // Писать можно только после входа.
-            let Some(author) = me.as_ref() else {
-                return send_error(sink, "Сначала войдите в чат").await;
-            };
-
             let text = match MessageText::parse(&text) {
                 Ok(text) => text,
                 Err(reason) => return send_error(sink, reason).await,
@@ -236,10 +270,6 @@ async fn handle_text(
             true
         }
         ClientMessage::Direct { to, text } => {
-            let Some(author) = me.as_ref() else {
-                return send_error(sink, "Сначала войдите в чат").await;
-            };
-
             let recipient = match UserName::parse(&to) {
                 Ok(recipient) => recipient,
                 Err(reason) => return send_error(sink, reason).await,
@@ -291,10 +321,6 @@ async fn handle_text(
                 .is_ok()
         }
         ClientMessage::Read { peer } => {
-            let Some(author) = me.as_ref() else {
-                return send_error(sink, "Сначала войдите в чат").await;
-            };
-
             let peer = match UserName::parse(&peer) {
                 Ok(peer) => peer,
                 Err(reason) => return send_error(sink, reason).await,
@@ -304,6 +330,11 @@ async fn handle_text(
             true
         }
     }
+}
+
+/// Ответ HTTP 401 в едином для API формате.
+fn unauthorized(message: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": message })))
 }
 
 /// Отправляет клиенту сообщение об ошибке; `false`, если отправка не удалась.

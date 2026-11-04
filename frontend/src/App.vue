@@ -32,7 +32,7 @@ const {
         key="login"
         :status="status"
         :error="error"
-        @join="connect"
+        @submit="connect"
       />
       <ChatView
         v-else

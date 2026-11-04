@@ -3,6 +3,7 @@
 //! Здесь собираются вместе конфигурация, подключение к PostgreSQL, общее
 //! состояние и HTTP/WebSocket-маршруты, после чего запускается axum.
 
+mod auth;
 mod config;
 mod db;
 mod protocol;

@@ -104,8 +104,6 @@ impl MessageText {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// Вход в чат под указанным именем.
-    Join { name: String },
     /// Публичное сообщение в общий канал.
     Message { text: String },
     /// Личное сообщение конкретному пользователю.

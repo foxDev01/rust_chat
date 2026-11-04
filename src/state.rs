@@ -12,6 +12,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::auth::{self, Account, AuthError, AuthSession};
 use crate::db::{ChatDb, THREAD_REPLAY};
 use crate::protocol::{
     ChatMessage, DirectMessage, DirectThread, ServerMessage, UserName, name_key,
@@ -74,6 +75,11 @@ impl ChatState {
 
     /// Восстанавливает публичную историю из PostgreSQL, чтобы перезапуск её не терял.
     pub async fn persisted(db: ChatDb) -> Result<Self, sqlx::Error> {
+        // Попутно чистим сессии, срок которых уже истёк.
+        if let Err(error) = db.purge_expired_sessions().await {
+            warn!(%error, "failed to purge expired sessions");
+        }
+
         let stored = db.load_public_history(HISTORY_LIMIT as i64).await?;
         let state = Self::with_db(Some(db));
 
@@ -108,6 +114,84 @@ impl ChatState {
         if let Some(db) = &self.inner.db {
             db.close().await;
         }
+    }
+
+    /// Регистрирует аккаунт и сразу открывает для него сессию.
+    pub async fn register(
+        &self,
+        username: &UserName,
+        password: &str,
+    ) -> Result<AuthSession, AuthError> {
+        let db = self.inner.db.as_ref().ok_or(AuthError::Unavailable)?;
+
+        // Argon2 намеренно медленный, поэтому считаем хеш вне async-рантайма.
+        let hash = auth::hash_password_async(password.to_owned())
+            .await
+            .map_err(AuthError::Internal)?;
+
+        match db
+            .create_account(username, &hash)
+            .await
+            .map_err(storage_error)?
+        {
+            Some(account) => self.open_session(account).await,
+            None => Err(AuthError::UsernameTaken),
+        }
+    }
+
+    /// Проверяет пароль и открывает новую сессию.
+    pub async fn login(&self, username: &str, password: &str) -> Result<AuthSession, AuthError> {
+        let db = self.inner.db.as_ref().ok_or(AuthError::Unavailable)?;
+
+        // Одинаковый ответ для несуществующего имени и неверного пароля,
+        // чтобы нельзя было перебором узнать, какие аккаунты есть.
+        let Some((account, hash)) = db
+            .find_account_by_key(&name_key(username))
+            .await
+            .map_err(storage_error)?
+        else {
+            return Err(AuthError::InvalidCredentials);
+        };
+
+        if !auth::verify_password_async(password.to_owned(), hash).await {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        self.open_session(account).await
+    }
+
+    /// Возвращает аккаунт по токену действующей сессии.
+    pub async fn authenticate(&self, token: &str) -> Option<Account> {
+        let db = self.inner.db.as_ref()?;
+        db.find_account_by_token(&auth::token_hash(token))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Отзывает сессию (выход из аккаунта).
+    pub async fn logout(&self, token: &str) {
+        if let Some(db) = &self.inner.db
+            && let Err(error) = db.delete_session(&auth::token_hash(token)).await
+        {
+            warn!(%error, "failed to delete a session");
+        }
+    }
+
+    /// Создаёт токен сессии и сохраняет его хеш в базе.
+    async fn open_session(&self, account: Account) -> Result<AuthSession, AuthError> {
+        let db = self.inner.db.as_ref().ok_or(AuthError::Unavailable)?;
+        let token = auth::new_token();
+
+        db.create_session(
+            account.id,
+            &auth::token_hash(&token),
+            auth::session_expiry(),
+        )
+        .await
+        .map_err(storage_error)?;
+
+        Ok(AuthSession { token, account })
     }
 
     /// Новый получатель широковещательных событий: у каждого соединения он свой.
@@ -287,6 +371,11 @@ impl Default for ChatState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Преобразует ошибку базы в доменную ошибку аутентификации.
+fn storage_error(error: sqlx::Error) -> AuthError {
+    AuthError::Internal(error.to_string())
 }
 
 /// Собирает имена участников и сортирует их без учёта регистра.

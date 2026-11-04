@@ -175,6 +175,49 @@ button:disabled {
   flex-direction: column;
 }
 
+/* Переключатель «Вход / Регистрация». */
+.auth-toggle {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 22px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0d1016;
+}
+
+.auth-toggle button {
+  flex: 1;
+  height: 38px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  transition:
+    background 0.18s ease,
+    color 0.18s ease;
+}
+
+.auth-toggle button:hover {
+  color: var(--text);
+}
+
+.auth-toggle .auth-toggle__button--active {
+  background: rgba(255, 107, 61, 0.16);
+  color: #ffd9c9;
+}
+
+/* Группа «подпись + поле» в форме входа. */
+.field {
+  margin-bottom: 12px;
+}
+
+.field .hint {
+  margin: 8px 2px 4px;
+}
+
 .login-form label {
   margin-bottom: 8px;
   color: var(--muted);

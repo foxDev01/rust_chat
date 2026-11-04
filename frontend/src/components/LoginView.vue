@@ -1,53 +1,84 @@
 <script setup lang="ts">
-// Экран входа: имя сохраняется в localStorage и проверяется ещё до отправки.
+// Экран входа и регистрации: имя и пароль проверяются ещё до отправки.
 import { computed, ref } from 'vue'
 import { NAME_STORAGE_KEY, type ConnectionStatus } from '../composables/useChat'
+import type { AuthForm, AuthMode } from '../types'
 
 const props = defineProps<{
   status: ConnectionStatus
   error: string
 }>()
 
-// Событие входа: родитель создаёт WebSocket-соединение.
+// Событие входа: родитель вызывает API и открывает WebSocket.
 const emit = defineEmits<{
-  join: [name: string]
+  submit: [form: AuthForm]
 }>()
 
+const mode = ref<AuthMode>('login')
 // Подставляем последнее использованное имя, если оно есть.
-const name = ref(localStorage.getItem(NAME_STORAGE_KEY) ?? '')
-// Показывать ли ошибку валидации (только после первой попытки отправки).
+const username = ref(localStorage.getItem(NAME_STORAGE_KEY) ?? '')
+const password = ref('')
+const confirmation = ref('')
+// Показывать ли ошибки валидации (только после первой попытки отправки).
 const touched = ref(false)
 
-// Пока идёт подключение, поле и кнопка блокируются.
+// Пока идёт подключение, поля и кнопка блокируются.
 const busy = computed(() => props.status === 'connecting')
+const isRegister = computed(() => mode.value === 'register')
 
-// Проверка длины имени на клиенте — сервер всё равно проверит его ещё раз.
+// Проверка на клиенте — сервер всё равно проверит имя и пароль ещё раз.
 const localError = computed(() => {
   if (!touched.value) {
     return ''
   }
 
-  const length = [...name.value.trim()].length
-  if (length < 2) {
+  const nameLength = [...username.value.trim()].length
+  if (nameLength < 2) {
     return 'Введите имя от 2 до 24 символов'
   }
-  if (length > 24) {
+  if (nameLength > 24) {
     return 'Имя слишком длинное'
   }
+
+  if ([...password.value].length < 8) {
+    return 'Пароль должен быть не короче 8 символов'
+  }
+
+  if (isRegister.value && password.value !== confirmation.value) {
+    return 'Пароли не совпадают'
+  }
+
   return ''
 })
 
-/** Проверяет имя и отправляет событие входа. */
-function submit() {
-  touched.value = true
-  const value = name.value.trim()
-
-  // Слишком короткое или длинное имя дальше не пропускаем.
-  if ([...value].length < 2 || [...value].length > 24) {
+/** Переключает вход и регистрацию, очищая пароль. */
+function switchMode(next: AuthMode) {
+  if (mode.value === next) {
     return
   }
 
-  emit('join', value)
+  mode.value = next
+  touched.value = false
+  password.value = ''
+  confirmation.value = ''
+}
+
+/** Проверяет форму и отправляет данные родителю. */
+function submit() {
+  touched.value = true
+  const value = username.value.trim()
+
+  if ([...value].length < 2 || [...value].length > 24) {
+    return
+  }
+  if ([...password.value].length < 8) {
+    return
+  }
+  if (isRegister.value && password.value !== confirmation.value) {
+    return
+  }
+
+  emit('submit', { username: value, password: password.value, mode: mode.value })
 }
 </script>
 
@@ -66,31 +97,83 @@ function submit() {
         </div>
       </div>
 
+      <!-- Переключатель между входом и регистрацией. -->
+      <div class="auth-toggle" role="tablist" aria-label="Вход или регистрация">
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="!isRegister"
+          :class="{ 'auth-toggle__button--active': !isRegister }"
+          @click="switchMode('login')"
+        >
+          Вход
+        </button>
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="isRegister"
+          :class="{ 'auth-toggle__button--active': isRegister }"
+          @click="switchMode('register')"
+        >
+          Регистрация
+        </button>
+      </div>
+
       <form class="login-form" @submit.prevent="submit">
-        <label for="nickname">Как вас зовут?</label>
-        <input
-          id="nickname"
-          v-model="name"
-          name="nickname"
-          maxlength="24"
-          autocomplete="nickname"
-          placeholder="Например, Феррис"
-          :disabled="busy"
-          autofocus
-        />
-        <p class="hint" :class="{ 'hint--error': localError }">
-          {{ localError || '2–24 символа: буквы, цифры, пробел, «_», «-»' }}
-        </p>
+        <div class="field">
+          <label for="username">Имя пользователя</label>
+          <input
+            id="username"
+            v-model="username"
+            name="username"
+            maxlength="24"
+            autocomplete="username"
+            placeholder="Например, Феррис"
+            :disabled="busy"
+            autofocus
+          />
+          <p class="hint" :class="{ 'hint--error': localError }">
+            {{ localError || '2–24 символа: буквы, цифры, пробел, «_», «-»' }}
+          </p>
+        </div>
+
+        <div class="field">
+          <label for="password">Пароль</label>
+          <input
+            id="password"
+            v-model="password"
+            name="password"
+            type="password"
+            maxlength="128"
+            :autocomplete="isRegister ? 'new-password' : 'current-password'"
+            placeholder="Не короче 8 символов"
+            :disabled="busy"
+          />
+        </div>
+
+        <div v-if="isRegister" class="field">
+          <label for="password-confirmation">Повторите пароль</label>
+          <input
+            id="password-confirmation"
+            v-model="confirmation"
+            name="password-confirmation"
+            type="password"
+            maxlength="128"
+            autocomplete="new-password"
+            placeholder="Ещё раз тот же пароль"
+            :disabled="busy"
+          />
+        </div>
 
         <p v-if="error" class="alert">{{ error }}</p>
 
         <button class="primary-button" type="submit" :disabled="busy">
           <span v-if="busy" class="spinner" aria-hidden="true"></span>
-          {{ busy ? 'Подключаемся…' : 'Войти в чат' }}
+          {{ busy ? 'Подключаемся…' : isRegister ? 'Создать аккаунт' : 'Войти в чат' }}
         </button>
       </form>
 
-      <p class="login-footer">Сервер: axum + tokio · Клиент: Vue 3 + TypeScript</p>
+      <p class="login-footer">Пароли хранятся в виде Argon2-хешей</p>
     </div>
   </section>
 </template>

@@ -28,10 +28,31 @@ export type ServerMessage =
 
 /** Сообщения, которые клиент отправляет серверу на Rust. */
 export type ClientMessage =
-  | { type: 'join'; name: string }
   | { type: 'message'; text: string }
   | { type: 'direct'; to: string; text: string }
   | { type: 'read'; peer: string }
+
+/** Режим формы входа: существующий аккаунт или создание нового. */
+export type AuthMode = 'login' | 'register'
+
+/** Данные, которые форма входа отправляет в хук чата. */
+export interface AuthForm {
+  username: string
+  password: string
+  mode: AuthMode
+}
+
+/** Публичные данные аккаунта. */
+export interface AuthUser {
+  id: string
+  username: string
+}
+
+/** Ответ сервера на вход или регистрацию. */
+export interface AuthResponse {
+  token: string
+  user: AuthUser
+}
 
 /** Личная переписка, восстановленная из PostgreSQL после входа. */
 export interface DirectThread {

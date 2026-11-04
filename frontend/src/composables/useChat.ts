@@ -1,5 +1,8 @@
-import { computed, ref, shallowRef } from 'vue'
+import { computed, onMounted, ref, shallowRef } from 'vue'
 import type {
+  AuthForm,
+  AuthResponse,
+  AuthUser,
   ChatItem,
   ChatMessage,
   ClientMessage,
@@ -15,22 +18,52 @@ export type ConnectionStatus = 'idle' | 'connecting' | 'online' | 'offline'
 
 /** Ключ в localStorage, где запоминается последнее имя пользователя. */
 export const NAME_STORAGE_KEY = 'rust-chat:name'
+/** Ключ в localStorage, где хранится токен сессии. */
+export const TOKEN_STORAGE_KEY = 'rust-chat:token'
 
-/** Адрес WebSocket: из `VITE_WS_URL` или тот же хост, что и у страницы. */
-function socketUrl(): string {
+/** Адрес WebSocket с токеном сессии в строке запроса. */
+function socketUrl(token: string): string {
   const configured = import.meta.env.VITE_WS_URL
-  if (configured) {
-    return configured
-  }
+  const base =
+    configured ??
+    `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
 
-  // На HTTPS используем защищённый WebSocket (wss).
-  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${scheme}://${window.location.host}/ws`
+  const url = new URL(base)
+  url.searchParams.set('token', token)
+  return url.toString()
 }
 
 /** Приводит имя к ключу для сравнения без учёта регистра. */
 function normalizeName(name: string): string {
   return name.trim().toLowerCase()
+}
+
+/** Заголовок авторизации для HTTP-запросов. */
+function authHeaders(token: string): HeadersInit {
+  return { Authorization: `Bearer ${token}` }
+}
+
+/** Выполняет запрос к API и превращает ошибку сервера в исключение с текстом. */
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let response: Response
+
+  try {
+    response = await fetch(path, init)
+  } catch {
+    throw new Error('Не удалось связаться с сервером')
+  }
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `Ошибка сервера (${response.status})`)
+  }
+
+  // У выхода из аккаунта нет тела ответа.
+  if (response.status === 204) {
+    return undefined as T
+  }
+
+  return (await response.json()) as T
 }
 
 /** Преобразует серверное сообщение общего канала в элемент ленты. */
@@ -71,8 +104,8 @@ function timeValue(value: string): number {
 /**
  * Состояние чата и все действия с ним.
  *
- * Хук хранит одно WebSocket-соединение, публичную ленту и личные переписки
- * по собеседникам; компоненты только отображают это состояние.
+ * Хук отвечает за вход по аккаунту, хранит одно WebSocket-соединение,
+ * публичную ленту и личные переписки по собеседникам.
  */
 export function useChat() {
   const socket = shallowRef<WebSocket | null>(null)
@@ -80,6 +113,9 @@ export function useChat() {
   const me = ref('')
   const users = ref<string[]>([])
   const timeline = ref<TimelineItem[]>([])
+
+  /** Токен текущей сессии; хранится в памяти и в localStorage. */
+  const token = ref('')
 
   /** Личные переписки: ключ — имя собеседника в нижнем регистре. */
   const directThreads = ref<Record<string, ChatItem[]>>({})
@@ -141,7 +177,7 @@ export function useChat() {
     current.close()
   }
 
-  /** Полностью очищает состояние после выхода из чата. */
+  /** Полностью очищает состояние чата, не трогая сохранённый токен. */
   function resetSession() {
     me.value = ''
     users.value = []
@@ -152,10 +188,12 @@ export function useChat() {
     activePeer.value = null
   }
 
-  /** Очищает только публичную часть — при переподключении под тем же именем. */
-  function resetPublicView() {
-    users.value = []
-    timeline.value = []
+  /** Удаляет токен и возвращает экран входа. */
+  function clearSession() {
+    token.value = ''
+    localStorage.removeItem(TOKEN_STORAGE_KEY)
+    resetSession()
+    status.value = 'idle'
   }
 
   /** Открывает личный диалог (или общий канал, если `peer === null`). */
@@ -290,35 +328,21 @@ export function useChat() {
     }
   }
 
-  /** Подключается к серверу под указанным именем. */
-  function connect(name: string) {
-    const trimmed = name.trim()
-    if (!trimmed) {
+  /** Открывает WebSocket с текущим токеном сессии. */
+  function openSocket() {
+    if (!token.value) {
+      status.value = 'idle'
       return
     }
 
-    // Переподключение под тем же именем сохраняет личные переписки, которые
-    // сервер хранит не для всех; вход под другим именем начинает с чистого листа.
-    const sameUser = me.value !== '' && normalizeName(trimmed) === normalizeName(me.value)
-
     closeSocket()
-    if (sameUser) {
-      resetPublicView()
-    } else {
-      resetSession()
-    }
-
     error.value = ''
     status.value = 'connecting'
     joinedSocket = false
 
-    const ws = new WebSocket(socketUrl())
+    const currentToken = token.value
+    const ws = new WebSocket(socketUrl(currentToken))
     socket.value = ws
-
-    // Как только соединение открыто, сразу представляемся серверу.
-    ws.onopen = () => {
-      send({ type: 'join', name: trimmed })
-    }
 
     ws.onmessage = (event) => {
       let message: ServerMessage
@@ -332,7 +356,7 @@ export function useChat() {
       handle(message)
     }
 
-    // Закрытие сокета: показываем «нет связи» или возвращаем экран входа.
+    // Соединение закрылось: проверяем, жива ли ещё сессия.
     ws.onclose = () => {
       // Игнорируем закрытие старого сокета, если уже создан новый.
       if (socket.value !== ws) {
@@ -340,31 +364,112 @@ export function useChat() {
       }
 
       socket.value = null
+      const welcomed = joinedSocket
       joinedSocket = false
-      if (me.value) {
-        status.value = 'offline'
-      } else {
-        status.value = 'idle'
-        if (!error.value) {
-          error.value = 'Не удалось подключиться к серверу'
-        }
+
+      if (!welcomed) {
+        void verifySession(currentToken)
+        return
+      }
+
+      status.value = me.value ? 'offline' : 'idle'
+      if (!me.value && !error.value) {
+        error.value = 'Не удалось подключиться к серверу'
       }
     }
   }
 
-  /** Переподключается под текущим именем после потери связи. */
-  function reconnect() {
-    const name = me.value
-    if (name) {
-      connect(name)
+  /** Проверяет сохранённый токен после неудачного апгрейда WebSocket. */
+  async function verifySession(currentToken: string) {
+    try {
+      const user = await api<AuthUser>('/api/me', { headers: authHeaders(currentToken) })
+
+      // Сессия жива: скорее всего, аккаунт уже открыт в другом окне.
+      me.value = user.username
+      status.value = 'offline'
+      if (!error.value) {
+        error.value = 'Соединение потеряно. Попробуйте переподключиться.'
+      }
+    } catch {
+      clearSession()
+      error.value = 'Сессия истекла, войдите снова'
     }
   }
 
-  /** Выходит из чата и очищает состояние. */
-  function leave() {
+  /** Входит в аккаунт или регистрирует новый. */
+  async function connect(form: AuthForm) {
+    const username = form.username.trim()
+    if (!username || !form.password) {
+      error.value = 'Введите имя и пароль'
+      return
+    }
+
     closeSocket()
     resetSession()
-    status.value = 'idle'
+    error.value = ''
+    status.value = 'connecting'
+
+    try {
+      const response = await api<AuthResponse>(
+        form.mode === 'register' ? '/api/register' : '/api/login',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password: form.password }),
+        },
+      )
+
+      token.value = response.token
+      localStorage.setItem(TOKEN_STORAGE_KEY, response.token)
+      localStorage.setItem(NAME_STORAGE_KEY, response.user.username)
+      me.value = response.user.username
+      openSocket()
+    } catch (cause) {
+      status.value = 'idle'
+      error.value = cause instanceof Error ? cause.message : 'Не удалось войти'
+    }
+  }
+
+  /** Восстанавливает сессию из localStorage при загрузке страницы. */
+  async function restoreSession() {
+    const stored = localStorage.getItem(TOKEN_STORAGE_KEY)
+    if (!stored) {
+      return
+    }
+
+    token.value = stored
+    status.value = 'connecting'
+
+    try {
+      const user = await api<AuthUser>('/api/me', { headers: authHeaders(stored) })
+      me.value = user.username
+      localStorage.setItem(NAME_STORAGE_KEY, user.username)
+      status.value = 'idle'
+      openSocket()
+    } catch {
+      clearSession()
+    }
+  }
+
+  /** Переподключается с текущим токеном после потери связи. */
+  function reconnect() {
+    openSocket()
+  }
+
+  /** Выходит из аккаунта: отзывает сессию и очищает состояние. */
+  function leave() {
+    const currentToken = token.value
+
+    closeSocket()
+    if (currentToken) {
+      // Выход не должен мешать интерфейсу, поэтому ошибку игнорируем.
+      void fetch('/api/logout', {
+        method: 'POST',
+        headers: authHeaders(currentToken),
+      }).catch(() => undefined)
+    }
+
+    clearSession()
     error.value = ''
     joinedSocket = false
   }
@@ -399,6 +504,11 @@ export function useChat() {
   function dismissError() {
     error.value = ''
   }
+
+  // При загрузке страницы пробуем войти по сохранённому токену.
+  onMounted(() => {
+    void restoreSession()
+  })
 
   return {
     status,
