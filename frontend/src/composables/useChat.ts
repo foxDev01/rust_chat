@@ -160,9 +160,20 @@ export function useChat() {
   let systemSequence = 0
   /** Успел ли текущий сокет получить `welcome` (то есть вход состоялся). */
   let joinedSocket = false
+  /** Таймер «welcome не пришёл»: не даёт интерфейсу навсегда зависнуть в «Подключаемся…». */
+  let welcomeTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** Отменяет таймер ожидания `welcome`. */
+  function clearWelcomeTimer() {
+    if (welcomeTimer !== null) {
+      clearTimeout(welcomeTimer)
+      welcomeTimer = null
+    }
+  }
 
   /** Закрывает текущее соединение и снимает обработчики, чтобы `onclose` не сработал. */
   function closeSocket() {
+    clearWelcomeTimer()
     const current = socket.value
     socket.value = null
 
@@ -345,6 +356,11 @@ export function useChat() {
     socket.value = ws
 
     ws.onmessage = (event) => {
+      // Игнорируем кадры старого сокета, если уже открыт новый.
+      if (socket.value !== ws) {
+        return
+      }
+
       let message: ServerMessage
       try {
         message = JSON.parse(event.data as string) as ServerMessage
@@ -354,6 +370,10 @@ export function useChat() {
       }
 
       handle(message)
+
+      if (joinedSocket) {
+        clearWelcomeTimer()
+      }
     }
 
     // Соединение закрылось: проверяем, жива ли ещё сессия.
@@ -364,6 +384,7 @@ export function useChat() {
       }
 
       socket.value = null
+      clearWelcomeTimer()
       const welcomed = joinedSocket
       joinedSocket = false
 
@@ -377,6 +398,18 @@ export function useChat() {
         error.value = 'Не удалось подключиться к серверу'
       }
     }
+
+    // Страховка: если сервер не ответил `welcome` за 10 секунд, выходим из
+    // «Подключаемся…» и проверяем сессию, чтобы экран не завис навсегда.
+    clearWelcomeTimer()
+    welcomeTimer = setTimeout(() => {
+      if (socket.value !== ws || joinedSocket) {
+        return
+      }
+
+      closeSocket()
+      void verifySession(currentToken)
+    }, 10_000)
   }
 
   /** Проверяет сохранённый токен после неудачного апгрейда WebSocket. */
