@@ -1,3 +1,8 @@
+//! Общее состояние чата: участники онлайн, история и рассылка событий.
+//!
+//! Состояние дешево клонируется: внутри лежит `Arc<Inner>`, поэтому один и тот
+//! же экземпляр используют все WebSocket-соединения и HTTP-обработчики.
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -12,42 +17,48 @@ use crate::protocol::{
     ChatMessage, DirectMessage, DirectThread, ServerMessage, UserName, name_key,
 };
 
-/// How many messages a newly connected client receives.
+/// Сколько последних сообщений получает новый клиент при подключении.
 pub const HISTORY_LIMIT: usize = 100;
 
-/// How many in-flight events a slow client may lag behind before skipping them.
+/// Сколько событий может накопиться у медленного клиента, прежде чем они начнут пропускаться.
 const BROADCAST_CAPACITY: usize = 256;
 
-/// How many private messages may wait for a recipient before delivery fails.
+/// Сколько личных сообщений может ждать получателя, прежде чем доставка не удастся.
 pub const PERSONAL_QUEUE: usize = 64;
 
-/// Shared, cheaply cloneable application state.
+/// Общее состояние приложения, которое дешево клонируется.
 #[derive(Clone)]
 pub struct ChatState {
     inner: Arc<Inner>,
 }
 
 struct Inner {
+    /// Канал широковещательной рассылки: у каждого соединения свой получатель.
     events: broadcast::Sender<ServerMessage>,
+    /// Подключённые пользователи: id соединения → имя и личная очередь.
     users: RwLock<BTreeMap<Uuid, User>>,
+    /// Ограниченная история общего канала (не более [`HISTORY_LIMIT`] сообщений).
     history: RwLock<VecDeque<ChatMessage>>,
-    /// `None` keeps the server memory-only, which tests rely on.
+    /// `None` — сервер работает только в памяти, на этом построены тесты.
     db: Option<ChatDb>,
 }
 
 struct User {
     name: String,
-    /// Private messages are pushed here instead of the shared broadcast channel,
-    /// so their contents never reach other connections.
+    /// Личные сообщения кладутся сюда, а не в общий broadcast-канал,
+    /// чтобы их содержимое не уходило другим соединениям.
     inbox: mpsc::Sender<ServerMessage>,
 }
 
+/// Ошибки, которые могут возникнуть при входе в чат.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinError {
+    /// Имя уже занято другим участником (сравнение без учёта регистра).
     NameTaken,
 }
 
 impl JoinError {
+    /// Текст ошибки для отправки клиенту.
     pub fn message(self) -> &'static str {
         match self {
             Self::NameTaken => "Это имя уже занято",
@@ -56,12 +67,12 @@ impl JoinError {
 }
 
 impl ChatState {
-    /// Memory-only state: used by tests and by `ChatState::persisted`.
+    /// Состояние только в памяти: используется тестами и внутри [`ChatState::persisted`].
     pub fn new() -> Self {
         Self::with_db(None)
     }
 
-    /// Restores the public history from PostgreSQL so a restart does not lose it.
+    /// Восстанавливает публичную историю из PostgreSQL, чтобы перезапуск её не терял.
     pub async fn persisted(db: ChatDb) -> Result<Self, sqlx::Error> {
         let stored = db.load_public_history(HISTORY_LIMIT as i64).await?;
         let state = Self::with_db(Some(db));
@@ -73,6 +84,7 @@ impl ChatState {
         Ok(state)
     }
 
+    /// Создаёт состояние с указанным (или отсутствующим) хранилищем.
     fn with_db(db: Option<ChatDb>) -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
 
@@ -86,26 +98,32 @@ impl ChatState {
         }
     }
 
+    /// Есть ли подключённая база данных.
     pub fn has_storage(&self) -> bool {
         self.inner.db.is_some()
     }
 
+    /// Закрывает пул соединений с базой при остановке сервера.
     pub async fn close_storage(&self) {
         if let Some(db) = &self.inner.db {
             db.close().await;
         }
     }
 
-    /// Every connection gets its own receiver; `broadcast` fans events out to all of them.
+    /// Новый получатель широковещательных событий: у каждого соединения он свой.
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMessage> {
         self.inner.events.subscribe()
     }
 
+    /// Отправляет событие всем подписчикам.
     pub fn broadcast(&self, message: ServerMessage) {
-        // An error only means nobody is listening, which is fine.
+        // Ошибка означает лишь то, что слушателей нет, — это нормально.
         let _ = self.inner.events.send(message);
     }
 
+    /// Регистрирует пользователя и возвращает отсортированный список участников.
+    ///
+    /// Имя сравнивается без учёта регистра, поэтому «Анна» и «анна» — одно и то же.
     pub async fn join(
         &self,
         id: Uuid,
@@ -129,6 +147,7 @@ impl ChatState {
         Ok(sorted_names(&users))
     }
 
+    /// Удаляет пользователя при отключении и возвращает его имя, если он был в чате.
     pub async fn leave(&self, id: Uuid) -> Option<String> {
         self.inner
             .users
@@ -138,13 +157,15 @@ impl ChatState {
             .map(|user| user.name)
     }
 
+    /// Имена участников онлайн, отсортированные без учёта регистра.
     pub async fn users(&self) -> Vec<String> {
         let users = self.inner.users.read().await;
         sorted_names(&users)
     }
 
-    /// Finds a joined user by name, ignoring case. Returns the connection id
-    /// and the name as it was registered.
+    /// Находит участника по имени без учёта регистра.
+    ///
+    /// Возвращает id соединения и имя в том написании, в котором пользователь вошёл.
     pub async fn find_user(&self, name: &str) -> Option<(Uuid, String)> {
         let key = name_key(name);
         let users = self.inner.users.read().await;
@@ -155,8 +176,9 @@ impl ChatState {
             .map(|(id, user)| (*id, user.name.clone()))
     }
 
-    /// Delivers a message to one connection. Returns `false` when the
-    /// recipient has gone away or its queue is full.
+    /// Доставляет сообщение одному соединению.
+    ///
+    /// Возвращает `false`, если получатель уже отключился или его очередь переполнена.
     pub async fn send_to(&self, id: Uuid, message: ServerMessage) -> bool {
         let inbox = {
             let users = self.inner.users.read().await;
@@ -169,18 +191,20 @@ impl ChatState {
         inbox.try_send(message).is_ok()
     }
 
+    /// Снимок текущей публичной истории.
     pub async fn history(&self) -> Vec<ChatMessage> {
         self.inner.history.read().await.iter().cloned().collect()
     }
 
-    /// Stores a message in the bounded history, persists it and broadcasts it.
+    /// Сохраняет сообщение в ограниченной истории, пишет его в базу и рассылает.
     ///
-    /// Holding the history lock while broadcasting keeps history order and
-    /// delivery order the same, even when several clients send at once.
+    /// Блокировка истории удерживается и во время рассылки, чтобы порядок в
+    /// истории совпадал с порядком доставки, даже если пишут несколько клиентов сразу.
     pub async fn publish(&self, message: ChatMessage) {
         {
             let mut history = self.inner.history.write().await;
 
+            // История ограничена: самое старое сообщение вытесняется.
             if history.len() == HISTORY_LIMIT {
                 history.pop_front();
             }
@@ -191,8 +215,8 @@ impl ChatState {
             });
         }
 
-        // The database is written outside the lock: `seq` decides the order after
-        // a restart, and the live session already agreed on the order above.
+        // В базу пишем вне блокировки: порядок после перезапуска задаёт `seq`,
+        // а в текущей сессии порядок уже определён выше.
         if let Some(db) = &self.inner.db
             && let Err(error) = db.save_public(&message).await
         {
@@ -200,8 +224,8 @@ impl ChatState {
         }
     }
 
-    /// Persists a private message before it is delivered, so a client can never
-    /// hold something the database does not have.
+    /// Сохраняет личное сообщение до его доставки, чтобы клиент никогда не получил
+    /// то, чего ещё нет в базе.
     pub async fn save_direct(&self, message: &DirectMessage) {
         if let Some(db) = &self.inner.db
             && let Err(error) = db.save_direct(message).await
@@ -210,8 +234,9 @@ impl ChatState {
         }
     }
 
-    /// Private conversations of `name` restored from the database. Peers who are
-    /// online right now are renamed to the spelling they registered with.
+    /// Личные переписки пользователя из базы.
+    ///
+    /// Если собеседник сейчас онлайн, имя приводится к написанию, под которым он вошёл.
     pub async fn direct_threads(&self, name: &str) -> Vec<DirectThread> {
         let Some(db) = &self.inner.db else {
             return Vec::new();
@@ -242,6 +267,7 @@ impl ChatState {
             .collect()
     }
 
+    /// Запоминает, что пользователь прочитал всё, что прислал собеседник.
     pub async fn mark_read(&self, user: &str, peer: &str) {
         if let Some(db) = &self.inner.db
             && let Err(error) = db.mark_read(user, peer).await
@@ -250,7 +276,7 @@ impl ChatState {
         }
     }
 
-    /// Stored row counts, `None` when running without a database.
+    /// Количество строк в хранилище; `None`, если базы нет.
     pub async fn storage_counts(&self) -> Option<(i64, i64)> {
         let db = self.inner.db.as_ref()?;
         db.counts().await.ok()
@@ -263,12 +289,14 @@ impl Default for ChatState {
     }
 }
 
+/// Собирает имена участников и сортирует их без учёта регистра.
 fn sorted_names(users: &BTreeMap<Uuid, User>) -> Vec<String> {
     let mut names: Vec<String> = users.values().map(|user| user.name.clone()).collect();
     names.sort_by_cached_key(|name| name_key(name));
     names
 }
 
+// Тесты работают только с состоянием в памяти и не требуют PostgreSQL.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +412,7 @@ mod tests {
     async fn history_is_bounded() {
         let state = ChatState::new();
 
+        // Публикуем больше сообщений, чем помещается в историю.
         for index in 0..(HISTORY_LIMIT + 5) {
             state.publish(message("bot", &index.to_string())).await;
         }

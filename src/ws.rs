@@ -1,3 +1,5 @@
+//! Обработка WebSocket-соединений: вход, сообщения, личные переписки и heartbeat.
+
 use axum::{
     extract::{
         State,
@@ -19,34 +21,41 @@ use crate::{
     state::{ChatState, PERSONAL_QUEUE},
 };
 
-/// A browser message is at most 2 000 chars, plus JSON overhead and multibyte text.
+/// Сообщение браузера — не больше 2 000 символов плюс JSON-обвязка и многобайтовый текст.
 const MAX_FRAME_SIZE: usize = 16 * 1024;
+/// Как часто отправляем ping, чтобы заметить мёртвое соединение.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 type SocketSink = SplitSink<WebSocket, Message>;
 
+/// Точка входа для `GET /ws`: проверяет параметры апгрейда и передаёт сокет обработчику.
 pub async fn upgrade(ws: WebSocketUpgrade, State(state): State<ChatState>) -> impl IntoResponse {
     ws.max_message_size(MAX_FRAME_SIZE)
         .max_frame_size(MAX_FRAME_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// Основной цикл одного соединения.
+///
+/// Параллельно обрабатываются четыре источника событий: входящие кадры,
+/// общая рассылка, личная очередь и heartbeat.
 async fn handle_socket(socket: WebSocket, state: ChatState) {
     let id = Uuid::new_v4();
     let (mut sink, mut stream) = socket.split();
 
-    // Subscribe before announcing the user, so no event is missed.
+    // Подписываемся до объявления пользователя, чтобы не пропустить ни одного события.
     let mut events = state.subscribe();
-    // Private messages arrive through a dedicated queue owned by this connection.
+    // Личные сообщения приходят через отдельную очередь, принадлежащую этому соединению.
     let (inbox, mut personal) = mpsc::channel::<ServerMessage>(PERSONAL_QUEUE);
     let mut me: Option<UserName> = None;
 
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    heartbeat.tick().await; // the first tick fires immediately
+    heartbeat.tick().await; // первый тик срабатывает сразу
 
     loop {
         tokio::select! {
+            // Входящий кадр от браузера.
             incoming = stream.next() => {
                 let Some(Ok(message)) = incoming else { break };
 
@@ -58,6 +67,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
                     }
                     Message::Close(_) => break,
                     Message::Binary(_) => {
+                        // Бинарные кадры протоколом не предусмотрены.
                         if send_json(
                             &mut sink,
                             &ServerMessage::Error {
@@ -70,9 +80,11 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
                             break;
                         }
                     }
+                    // Ping/Pong обслуживает сам axum, здесь реакции не нужны.
                     Message::Ping(_) | Message::Pong(_) => {}
                 }
             }
+            // Событие общей рассылки (сообщения, системные уведомления, список участников).
             event = events.recv() => {
                 match event {
                     Ok(event) if me.is_some() => {
@@ -80,13 +92,14 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
                             break;
                         }
                     }
-                    Ok(_) => {} // not joined yet, nothing to show
+                    Ok(_) => {} // пользователь ещё не вошёл — показывать нечего
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(%id, skipped, "client is too slow, events were skipped");
                     }
                     Err(RecvError::Closed) => break,
                 }
             }
+            // Личное сообщение для этого пользователя.
             personal_message = personal.recv() => {
                 match personal_message {
                     Some(event) if me.is_some() => {
@@ -94,10 +107,11 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
                             break;
                         }
                     }
-                    Some(_) => {} // not joined yet, nothing to show
+                    Some(_) => {} // пользователь ещё не вошёл — показывать нечего
                     None => break,
                 }
             }
+            // Периодический ping: если отправить не удалось, соединение мертво.
             _ = heartbeat.tick() => {
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
@@ -106,6 +120,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
         }
     }
 
+    // Сообщаем остальным, что участник вышел (если он вообще успел войти).
     if let Some(name) = state.leave(id).await {
         info!(%id, %name, "user left");
         state.broadcast(ServerMessage::System {
@@ -121,7 +136,9 @@ async fn handle_socket(socket: WebSocket, state: ChatState) {
     debug!(%id, "connection closed");
 }
 
-/// Handles one client payload. Returns `false` when the connection should close.
+/// Обрабатывает один текстовый кадр клиента.
+///
+/// Возвращает `false`, если соединение нужно закрыть (например, не удалось отправить ответ).
 async fn handle_text(
     raw: &str,
     id: Uuid,
@@ -130,6 +147,7 @@ async fn handle_text(
     inbox: &mpsc::Sender<ServerMessage>,
     sink: &mut SocketSink,
 ) -> bool {
+    // Неизвестный или битый JSON — просто ошибка протокола, соединение не рвём.
     let message = match serde_json::from_str::<ClientMessage>(raw) {
         Ok(message) => message,
         Err(error) => {
@@ -140,6 +158,7 @@ async fn handle_text(
 
     match message {
         ClientMessage::Join { name } => {
+            // Повторный вход в одном соединении запрещён.
             if me.is_some() {
                 return send_error(sink, "Вы уже вошли в чат").await;
             }
@@ -156,6 +175,7 @@ async fn handle_text(
 
             *me = Some(name.clone());
 
+            // Приветствие: кто вы и кто сейчас онлайн.
             let welcome = ServerMessage::Welcome {
                 you: name.to_string(),
                 users,
@@ -164,6 +184,7 @@ async fn handle_text(
                 return false;
             }
 
+            // Публичная история общего канала.
             let history = ServerMessage::History {
                 messages: state.history().await,
             };
@@ -171,8 +192,8 @@ async fn handle_text(
                 return false;
             }
 
-            // Private conversations are not part of the public history: the client
-            // needs them per peer, with unread counters.
+            // Личные переписки не входят в публичную историю: клиенту нужны
+            // они отдельно по собеседникам, со счётчиками непрочитанных.
             let threads = state.direct_threads(name.as_str()).await;
             if !threads.is_empty() {
                 let restored = ServerMessage::DirectHistory { threads };
@@ -193,6 +214,7 @@ async fn handle_text(
             true
         }
         ClientMessage::Message { text } => {
+            // Писать можно только после входа.
             let Some(author) = me.as_ref() else {
                 return send_error(sink, "Сначала войдите в чат").await;
             };
@@ -209,6 +231,7 @@ async fn handle_text(
                 sent_at: Utc::now(),
             };
 
+            // Публикация сама сохранит сообщение и разошлёт его всем.
             state.publish(message).await;
             true
         }
@@ -227,6 +250,7 @@ async fn handle_text(
                 Err(reason) => return send_error(sink, reason).await,
             };
 
+            // Личные сообщения доставляются только тем, кто сейчас онлайн.
             let Some((recipient_id, recipient_name)) = state.find_user(recipient.as_str()).await
             else {
                 return send_error(sink, "Пользователь не в сети").await;
@@ -244,8 +268,8 @@ async fn handle_text(
                 sent_at: Utc::now(),
             };
 
-            // Persist first: a restored thread must never miss a message that
-            // some client has already received.
+            // Сначала сохраняем: восстановленный диалог не должен потерять
+            // сообщение, которое клиент уже получил.
             state.save_direct(&message).await;
 
             if !state
@@ -260,8 +284,8 @@ async fn handle_text(
                 return send_error(sink, "Не удалось доставить сообщение").await;
             }
 
-            // Echo to the sender through its own socket; the recipient already
-            // got a copy through its private queue.
+            // Копию отправителю шлём в его же сокет; получатель уже получил
+            // свою копию через личную очередь.
             send_json(sink, &ServerMessage::Direct { message })
                 .await
                 .is_ok()
@@ -282,6 +306,7 @@ async fn handle_text(
     }
 }
 
+/// Отправляет клиенту сообщение об ошибке; `false`, если отправка не удалась.
 async fn send_error(sink: &mut SocketSink, message: &str) -> bool {
     send_json(
         sink,
@@ -293,6 +318,7 @@ async fn send_error(sink: &mut SocketSink, message: &str) -> bool {
     .is_ok()
 }
 
+/// Сериализует сообщение сервера в JSON и отправляет его в сокет.
 async fn send_json(sink: &mut SocketSink, message: &ServerMessage) -> Result<(), axum::Error> {
     let payload =
         serde_json::to_string(message).expect("ServerMessage serialization is infallible");

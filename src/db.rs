@@ -1,8 +1,7 @@
-//! PostgreSQL storage: public history, private threads and read marks.
+//! Хранилище PostgreSQL: публичная история, личные переписки и отметки о прочтении.
 //!
-//! The schema lives in `migrations/001_init.sql` and is applied on every start;
-//! all statements are idempotent, so the server can boot against an existing
-//! database.
+//! Схема описана в `migrations/001_init.sql` и применяется при каждом старте;
+//! все команды идемпотентны, поэтому сервер можно запускать на готовой базе.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -14,17 +13,24 @@ use tracing::info;
 
 use crate::protocol::{ChatMessage, DirectMessage, DirectThread, name_key};
 
+/// Тайм-аут установки соединения с базой.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Максимальное число соединений в пуле.
 const MAX_CONNECTIONS: u32 = 5;
 
-/// How many recent messages of one conversation are replayed when a user joins.
+/// Сколько последних сообщений одного диалога восстанавливается при входе пользователя.
 pub const THREAD_REPLAY: i64 = 100;
 
+/// Пул подключений к PostgreSQL.
 pub struct ChatDb {
     pool: PgPool,
 }
 
 impl ChatDb {
+    /// Подключается к базе и применяет схему чата.
+    ///
+    /// Ошибки оборачиваются в понятные сообщения, чтобы при старте было видно,
+    /// что именно пошло не так: строка подключения, доступность сервера или схема.
     pub async fn connect(url: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let options: PgConnectOptions = url
             .parse()
@@ -42,6 +48,7 @@ impl ChatDb {
                 )
             })?;
 
+        // Схема применяется целиком; повторный запуск ничего не ломает.
         sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
             .execute(&pool)
             .await
@@ -51,10 +58,12 @@ impl ChatDb {
         Ok(Self { pool })
     }
 
+    /// Закрывает все соединения пула.
     pub async fn close(&self) {
         self.pool.close().await;
     }
 
+    /// Сохраняет сообщение общего канала.
     pub async fn save_public(&self, message: &ChatMessage) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO chat_messages (id, author, body, sent_at) VALUES ($1, $2, $3, $4)",
@@ -69,8 +78,9 @@ impl ChatDb {
         Ok(())
     }
 
-    /// The last `limit` public messages, oldest first.
+    /// Последние `limit` публичных сообщений, самые старые первыми.
     pub async fn load_public_history(&self, limit: i64) -> Result<Vec<ChatMessage>, sqlx::Error> {
+        // Берём хвост истории по убыванию seq, а затем разворачиваем его.
         let rows = sqlx::query(
             "SELECT id, author, body, sent_at FROM chat_messages ORDER BY seq DESC LIMIT $1",
         )
@@ -90,6 +100,7 @@ impl ChatDb {
             .collect())
     }
 
+    /// Сохраняет личное сообщение вместе с ключами имён без учёта регистра.
     pub async fn save_direct(&self, message: &DirectMessage) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO direct_messages (id, sender, recipient, sender_key, recipient_key, body, sent_at)
@@ -108,7 +119,8 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Private conversations of `name`, newest message last, most recent peer first.
+    /// Личные переписки пользователя: в каждой — последние сообщения,
+    /// самые старые первыми, а список диалогов отсортирован по свежести.
     pub async fn load_direct_threads(
         &self,
         name: &str,
@@ -116,6 +128,9 @@ impl ChatDb {
     ) -> Result<Vec<DirectThread>, sqlx::Error> {
         let key = name_key(name);
 
+        // Для каждого сообщения определяем собеседника (`peer_key`), затем
+        // нумеруем сообщения внутри диалога от новых к старым и оставляем
+        // только `per_thread` последних.
         let messages = sqlx::query(
             "WITH involved AS (
                  SELECT seq, id, sender, recipient, body, sent_at,
@@ -137,6 +152,7 @@ impl ChatDb {
         .fetch_all(&self.pool)
         .await?;
 
+        // Непрочитанные считаем как сообщения, пришедшие после отметки `direct_reads`.
         let unread_rows = sqlx::query(
             "SELECT m.sender_key AS peer_key, COUNT(*) AS unread
              FROM direct_messages m
@@ -150,6 +166,7 @@ impl ChatDb {
         .fetch_all(&self.pool)
         .await?;
 
+        /// Промежуточная запись диалога при сборке результата.
         #[derive(Default)]
         struct Thread {
             peer: String,
@@ -160,13 +177,14 @@ impl ChatDb {
 
         let mut threads: BTreeMap<String, Thread> = BTreeMap::new();
 
+        // Складываем сообщения в диалоги по ключу собеседника.
         for row in messages {
             let peer_key: String = row.get("peer_key");
             let sender: String = row.get("sender");
             let recipient: String = row.get("recipient");
 
             let entry = threads.entry(peer_key.clone()).or_default();
-            // Prefer the spelling the peer itself used when joining.
+            // Предпочитаем написание, которое собеседник использовал при входе.
             entry.peer = if name_key(&sender) == key {
                 recipient.clone()
             } else {
@@ -183,6 +201,7 @@ impl ChatDb {
             });
         }
 
+        // Добавляем счётчики непрочитанных; диалог мог не попасть в выборку сообщений.
         for row in unread_rows {
             let peer_key: String = row.get("peer_key");
             let unread: i64 = row.get("unread");
@@ -204,6 +223,7 @@ impl ChatDb {
             })
             .collect();
 
+        // Свежие диалоги — первыми.
         result.sort_by_key(|thread| {
             thread
                 .messages
@@ -216,11 +236,12 @@ impl ChatDb {
         Ok(result)
     }
 
-    /// Remembers that `user` has read everything sent by `peer` so far.
+    /// Запоминает, что `user` прочитал всё, что `peer` отправил к этому моменту.
     pub async fn mark_read(&self, user: &str, peer: &str) -> Result<(), sqlx::Error> {
         let user_key = name_key(user);
         let peer_key = name_key(peer);
 
+        // Отметка ставится на максимальный seq в диалоге в обе стороны.
         let last_seq: i64 = sqlx::query(
             "SELECT COALESCE(MAX(seq), 0) AS last_seq
              FROM direct_messages
@@ -233,6 +254,7 @@ impl ChatDb {
         .await?
         .get("last_seq");
 
+        // Счётчик прочитанного может только расти.
         sqlx::query(
             "INSERT INTO direct_reads (user_key, peer_key, last_seq, read_at)
              VALUES ($1, $2, $3, now())
@@ -249,7 +271,7 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Row counts for `GET /api/health`.
+    /// Количество строк в таблицах для `GET /api/health`.
     pub async fn counts(&self) -> Result<(i64, i64), sqlx::Error> {
         let row = sqlx::query(
             "SELECT (SELECT COUNT(*) FROM chat_messages) AS public,
@@ -261,7 +283,7 @@ impl ChatDb {
         Ok((row.get("public"), row.get("direct")))
     }
 
-    /// Removes all stored messages. Used by the PostgreSQL integration test.
+    /// Удаляет все сохранённые сообщения. Используется интеграционным тестом PostgreSQL.
     #[cfg(test)]
     async fn truncate(&self) -> Result<(), sqlx::Error> {
         sqlx::query("TRUNCATE chat_messages, direct_messages, direct_reads RESTART IDENTITY")
@@ -272,6 +294,7 @@ impl ChatDb {
     }
 }
 
+// Интеграционные тесты требуют запущенного PostgreSQL и по умолчанию пропускаются.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,7 +320,7 @@ mod tests {
         }
     }
 
-    // Requires a running PostgreSQL, e.g.
+    // Требует запущенного PostgreSQL, например:
     //   $env:CHAT_DB_URL = "postgres://<user>:<password>@localhost:5432/rust_chat"
     //   cargo test -- --ignored
     #[tokio::test]
@@ -310,6 +333,7 @@ mod tests {
         db.save_public(&public("первое")).await.unwrap();
         db.save_public(&public("второе")).await.unwrap();
 
+        // Лимит соблюдается, а последнее сообщение считается самым новым.
         let history = db.load_public_history(1).await.unwrap();
         assert_eq!(history.len(), 1, "limit is respected");
         assert_eq!(history[0].text, "второе", "newest message wins");
@@ -321,6 +345,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Один диалог независимо от регистра имён, ответ Боба не прочитан.
         let threads = db
             .load_direct_threads("алиса", THREAD_REPLAY)
             .await
@@ -329,6 +354,7 @@ mod tests {
         assert_eq!(threads[0].messages.len(), 2);
         assert_eq!(threads[0].unread, 1, "the reply from Боб is unread");
 
+        // Отметка о прочтении обнуляет счётчик.
         db.mark_read("Алиса", "боб").await.unwrap();
         let after = db
             .load_direct_threads("Алиса", THREAD_REPLAY)

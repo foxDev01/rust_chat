@@ -1,9 +1,11 @@
 <script setup lang="ts">
+// Экран чата: боковая панель с диалогами и участниками, лента и поле ввода.
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { type ConnectionStatus } from '../composables/useChat'
 import type { ConversationSummary, TimelineItem } from '../types'
 import MessageBubble from './MessageBubble.vue'
 
+// Компонент не хранит состояние чата — только получает его через props.
 const props = defineProps<{
   me: string
   users: string[]
@@ -14,6 +16,7 @@ const props = defineProps<{
   error: string
 }>()
 
+// События наружу: отправка сообщения, выбор диалога, выход и переподключение.
 const emit = defineEmits<{
   send: [text: string]
   openConversation: [peer: string | null]
@@ -22,6 +25,7 @@ const emit = defineEmits<{
   dismissError: []
 }>()
 
+// Подписи для индикатора состояния соединения.
 const STATUS_LABELS: Record<ConnectionStatus, string> = {
   idle: 'Не подключено',
   connecting: 'Подключаемся…',
@@ -29,14 +33,18 @@ const STATUS_LABELS: Record<ConnectionStatus, string> = {
   offline: 'Нет связи',
 }
 
+// Локальное состояние интерфейса: черновик сообщения, прокрутка и мобильное меню.
 const draft = ref('')
 const listEl = ref<HTMLDivElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
+// Прижата ли лента к низу: если пользователь листает историю, не дёргаем её.
 const pinnedToBottom = ref(true)
 const sidebarOpen = ref(false)
 
+// Открыт личный диалог (иначе показан общий канал).
 const isDirect = computed(() => props.activePeer !== null)
 
+// В сети ли собеседник открытого диалога.
 const peerOnline = computed(() => {
   const peer = props.activePeer
   if (!peer) {
@@ -47,6 +55,7 @@ const peerOnline = computed(() => {
   return props.users.some((user) => normalize(user) === key)
 })
 
+// Можно ли отправить: есть соединение, получатель доступен и текст не пустой.
 const canSend = computed(
   () =>
     props.status === 'online' &&
@@ -54,6 +63,7 @@ const canSend = computed(
     draft.value.trim().length > 0,
 )
 
+// Пояснение над лентой, если что-то мешает общению.
 const connectionNote = computed(() => {
   if (props.status === 'offline') {
     return 'Соединение потеряно. Проверьте, что сервер запущен, и попробуйте снова.'
@@ -67,6 +77,7 @@ const connectionNote = computed(() => {
   return ''
 })
 
+// Подзаголовок в шапке: тип канала и число участников или статус собеседника.
 const subtitle = computed(() => {
   if (props.activePeer) {
     return peerOnline.value
@@ -76,6 +87,7 @@ const subtitle = computed(() => {
   return `Общий канал · ${props.users.length} онлайн`
 })
 
+// Текст-заполнитель поля ввода зависит от состояния соединения и диалога.
 const placeholder = computed(() => {
   if (props.status !== 'online') {
     return 'Нет соединения'
@@ -89,12 +101,14 @@ const placeholder = computed(() => {
   return `Сообщение для ${props.activePeer}…`
 })
 
+// Подсказка под полем ввода.
 const composerHint = computed(() =>
   isDirect.value
     ? 'Enter — отправить, Shift + Enter — новая строка · видят только вы двое'
     : 'Enter — отправить, Shift + Enter — новая строка',
 )
 
+// Что показать, пока в ленте нет сообщений.
 const emptyText = computed(() => {
   if (props.activePeer) {
     return `Пока ни одного сообщения. Напишите ${props.activePeer} — это увидите только вы вдвоём.`
@@ -102,19 +116,23 @@ const emptyText = computed(() => {
   return 'Пока тихо. Напишите первым — сообщение увидят все, кто сейчас в чате.'
 })
 
+// Время в формате «ЧЧ:ММ».
 const timeFormatter = new Intl.DateTimeFormat('ru-RU', {
   hour: '2-digit',
   minute: '2-digit',
 })
 
+/** Имя без пробелов по краям и в нижнем регистре — для сравнения. */
 function normalize(name: string): string {
   return name.trim().toLowerCase()
 }
 
+/** Совпадают ли имена без учёта регистра. */
 function sameName(first: string, second: string): boolean {
   return normalize(first) === normalize(second)
 }
 
+/** Выбран ли этот диалог (учитывая, что имена сравниваются без учёта регистра). */
 function isActive(peer: string | null): boolean {
   if (peer === null || props.activePeer === null) {
     return peer === null && props.activePeer === null
@@ -122,11 +140,13 @@ function isActive(peer: string | null): boolean {
   return sameName(peer, props.activePeer)
 }
 
+/** Форматирует время сообщения; при ошибке разбора возвращает пустую строку. */
 function formatTime(value: string): string {
   const date = new Date(value.replace(/\.(\d{3})\d+/, '.$1'))
   return Number.isNaN(date.getTime()) ? '' : timeFormatter.format(date)
 }
 
+/** Детерминированный цвет аватара: один и тот же оттенок для одного и того же имени. */
 function avatarStyle(name: string): Record<string, string> {
   let hash = 0
   for (const char of name) {
@@ -135,10 +155,12 @@ function avatarStyle(name: string): Record<string, string> {
   return { '--avatar-hue': String(hash) }
 }
 
+/** Первая буква имени для аватара. */
 function initial(name: string): string {
   return [...name][0]?.toUpperCase() ?? '?'
 }
 
+/** Прокручивает ленту вниз и снова прижимает её к низу. */
 function scrollToBottom() {
   const el = listEl.value
   if (el) {
@@ -147,6 +169,7 @@ function scrollToBottom() {
   }
 }
 
+/** Считаем ленту прижатой к низу, если до края меньше 80 пикселей. */
 function onScroll() {
   const el = listEl.value
   if (!el) {
@@ -155,6 +178,7 @@ function onScroll() {
   pinnedToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80
 }
 
+/** Подстраивает высоту textarea под текст, но не выше 160 пикселей. */
 function resize() {
   const el = textareaEl.value
   if (!el) {
@@ -164,11 +188,13 @@ function resize() {
   el.style.height = `${Math.min(el.scrollHeight, 160)}px`
 }
 
+/** Переключает диалог и закрывает мобильную панель. */
 function open(peer: string | null) {
   sidebarOpen.value = false
   emit('openConversation', peer)
 }
 
+/** Отправляет черновик и возвращает ленту к низу. */
 function submit() {
   if (!canSend.value) {
     return
@@ -185,6 +211,7 @@ function submit() {
   })
 }
 
+/** Enter отправляет сообщение, Shift+Enter добавляет новую строку. */
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault()
@@ -192,6 +219,7 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+// При смене диалога очищаем черновик и прокручиваем новую ленту вниз.
 watch(
   () => props.activePeer,
   async () => {
@@ -203,6 +231,7 @@ watch(
   },
 )
 
+// Новые сообщения прокручиваем только если пользователь не читает историю выше.
 watch(
   () => props.timeline.length,
   async () => {
@@ -222,8 +251,10 @@ onMounted(async () => {
 
 <template>
   <section class="chat-screen">
+    <!-- Затемнение фона, когда на мобильном открыта панель диалогов. -->
     <div v-if="sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
 
+    <!-- Боковая панель: общий канал, личные переписки и участники онлайн. -->
     <aside class="sidebar" :class="{ 'sidebar--open': sidebarOpen }">
       <button
         class="room room-button"
@@ -238,6 +269,7 @@ onMounted(async () => {
         </div>
       </button>
 
+      <!-- Личные диалоги: счётчик непрочитанных и время последнего сообщения. -->
       <div v-if="conversations.length" class="sidebar-section">
         <p class="sidebar-label">Личные сообщения</p>
         <ul class="user-list">
@@ -265,6 +297,7 @@ onMounted(async () => {
         </ul>
       </div>
 
+      <!-- Участники онлайн: по нажатию открывается личный диалог. -->
       <div class="sidebar-section">
         <p class="sidebar-label">Участники</p>
         <ul class="user-list">
@@ -298,6 +331,7 @@ onMounted(async () => {
     </aside>
 
     <div class="chat-main">
+      <!-- Шапка: название канала, статус и действия. -->
       <header class="chat-header">
         <div class="chat-heading">
           <h2 v-if="activePeer"><span class="at-sign">@</span> {{ activePeer }}</h2>
@@ -326,6 +360,7 @@ onMounted(async () => {
         </div>
       </header>
 
+      <!-- Предупреждение о потере связи или недоступном собеседнике. -->
       <div
         v-if="connectionNote"
         class="banner"
@@ -334,6 +369,7 @@ onMounted(async () => {
         <span>{{ connectionNote }}</span>
       </div>
 
+      <!-- Сообщение об ошибке, которое можно закрыть. -->
       <div v-if="error" class="banner banner--error">
         <span>{{ error }}</span>
         <button type="button" class="banner-close" aria-label="Скрыть" @click="emit('dismissError')">
@@ -341,6 +377,7 @@ onMounted(async () => {
         </button>
       </div>
 
+      <!-- Лента сообщений: системные уведомления и обычные сообщения. -->
       <div ref="listEl" class="messages" @scroll="onScroll">
         <p v-if="timeline.length === 0" class="empty-state">
           {{ emptyText }}
@@ -359,6 +396,7 @@ onMounted(async () => {
         </template>
       </div>
 
+      <!-- Поле ввода: Enter отправляет, Shift+Enter переносит строку. -->
       <form class="composer" @submit.prevent="submit">
         <textarea
           ref="textareaEl"

@@ -1,22 +1,28 @@
-//! Wire protocol shared by the server and the browser client.
+//! Протокол обмена между сервером и браузерным клиентом.
 //!
-//! Incoming values are parsed into types that can only hold valid data
-//! ([`UserName`], [`MessageText`]), so the rest of the server never has to
-//! re-check them.
+//! Входящие значения сразу разбираются в типы, которые могут содержать только
+//! корректные данные ([`UserName`], [`MessageText`]), поэтому остальному коду
+//! сервера не нужно повторно проверять их.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Минимальная длина имени пользователя в символах.
 pub const MIN_NAME_LEN: usize = 2;
+/// Максимальная длина имени пользователя в символах.
 pub const MAX_NAME_LEN: usize = 24;
+/// Максимальная длина текста сообщения в символах.
 pub const MAX_MESSAGE_LEN: usize = 2_000;
 
-/// A name that has passed validation.
+/// Имя пользователя, прошедшее проверку.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserName(String);
 
 impl UserName {
+    /// Проверяет имя и возвращает его в нормализованном виде (без пробелов по краям).
+    ///
+    /// Допустимы буквы, цифры, пробел, `_` и `-`; длина — от 2 до 24 символов.
     pub fn parse(raw: &str) -> Result<Self, &'static str> {
         let name = raw.trim();
         let len = name.chars().count();
@@ -35,6 +41,7 @@ impl UserName {
         Ok(Self(name.to_owned()))
     }
 
+    /// Возвращает имя в том виде, в котором оно было зарегистрировано.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,17 +53,24 @@ impl std::fmt::Display for UserName {
     }
 }
 
-/// Names are compared case-insensitively everywhere: online users, lookups and
-/// the `*_key` columns in PostgreSQL. Keep this the single source of truth.
+/// Приводит имя к ключу сравнения.
+///
+/// Имена сравниваются без учёта регистра везде: в списке онлайн-участников,
+/// при поиске пользователя и в колонках `*_key` в PostgreSQL. Эта функция —
+/// единственный источник истины для такого сравнения.
 pub fn name_key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// Message text that has passed validation.
+/// Текст сообщения, прошедший проверку.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageText(String);
 
 impl MessageText {
+    /// Проверяет текст сообщения и обрезает пробелы по краям.
+    ///
+    /// Пустые сообщения и текст длиннее [`MAX_MESSAGE_LEN`] отклоняются;
+    /// управляющие символы запрещены, кроме перевода строки и табуляции.
     pub fn parse(raw: &str) -> Result<Self, &'static str> {
         let text = raw.trim();
 
@@ -78,32 +92,29 @@ impl MessageText {
         Ok(Self(text.to_owned()))
     }
 
+    /// Забирает проверенный текст, чтобы сохранить его или отправить дальше.
     pub fn into_string(self) -> String {
         self.0
     }
 }
 
-/// What the browser sends to the server.
+/// Сообщение, которое браузер отправляет серверу.
+///
+/// Поле `type` в JSON задаёт вариант: `join`, `message`, `direct` или `read`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Join {
-        name: String,
-    },
-    Message {
-        text: String,
-    },
-    Direct {
-        to: String,
-        text: String,
-    },
-    /// Marks every private message from `peer` as read by the current user.
-    Read {
-        peer: String,
-    },
+    /// Вход в чат под указанным именем.
+    Join { name: String },
+    /// Публичное сообщение в общий канал.
+    Message { text: String },
+    /// Личное сообщение конкретному пользователю.
+    Direct { to: String, text: String },
+    /// Отмечает все личные сообщения от `peer` прочитанными текущим пользователем.
+    Read { peer: String },
 }
 
-/// A chat message as stored in history and broadcast to clients.
+/// Сообщение общего канала: хранится в истории и рассылается всем клиентам.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
     pub id: Uuid,
@@ -112,7 +123,7 @@ pub struct ChatMessage {
     pub sent_at: DateTime<Utc>,
 }
 
-/// A private message delivered only to its sender and recipient.
+/// Личное сообщение: доставляется только отправителю и получателю.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DirectMessage {
     pub id: Uuid,
@@ -122,25 +133,38 @@ pub struct DirectMessage {
     pub sent_at: DateTime<Utc>,
 }
 
-/// A private conversation restored from PostgreSQL when a user joins.
+/// Личная переписка, восстановленная из PostgreSQL при входе пользователя.
 #[derive(Debug, Clone, Serialize)]
 pub struct DirectThread {
+    /// Собеседник в том написании, которое он использовал при входе.
     pub peer: String,
+    /// Последние сообщения диалога в хронологическом порядке.
     pub messages: Vec<DirectMessage>,
+    /// Сколько сообщений от собеседника пользователь ещё не прочитал.
     pub unread: i64,
 }
 
-/// What the server sends to the browser.
+/// Сообщение, которое сервер отправляет браузеру.
+///
+/// Поле `type` в JSON задаёт вариант; клиент разбирает его в `frontend/src/types.ts`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Успешный вход: имя пользователя и список участников онлайн.
     Welcome { you: String, users: Vec<String> },
+    /// Публичная история на момент подключения.
     History { messages: Vec<ChatMessage> },
+    /// Новое сообщение общего канала.
     Message { message: ChatMessage },
+    /// Новое личное сообщение.
     Direct { message: DirectMessage },
+    /// Личные переписки пользователя, восстановленные из базы.
     DirectHistory { threads: Vec<DirectThread> },
+    /// Системное уведомление (вход или выход участника).
     System { text: String, at: DateTime<Utc> },
+    /// Актуальный список участников онлайн.
     Users { users: Vec<String> },
+    /// Ошибка, которую нужно показать пользователю.
     Error { message: String },
 }
 

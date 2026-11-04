@@ -1,3 +1,4 @@
+/** Публичное сообщение общего канала (совпадает с `ChatMessage` в `src/protocol.rs`). */
 export interface ChatMessage {
   id: string
   author: string
@@ -5,6 +6,7 @@ export interface ChatMessage {
   sent_at: string
 }
 
+/** Личное сообщение между двумя пользователями. */
 export interface DirectMessage {
   id: string
   from: string
@@ -13,7 +15,7 @@ export interface DirectMessage {
   sent_at: string
 }
 
-/** Messages sent by the Rust server (see `src/protocol.rs`). */
+/** Сообщения, которые присылает сервер на Rust (см. `src/protocol.rs`). */
 export type ServerMessage =
   | { type: 'welcome'; you: string; users: string[] }
   | { type: 'history'; messages: ChatMessage[] }
@@ -24,30 +26,35 @@ export type ServerMessage =
   | { type: 'users'; users: string[] }
   | { type: 'error'; message: string }
 
-/** Messages sent to the Rust server. */
+/** Сообщения, которые клиент отправляет серверу на Rust. */
 export type ClientMessage =
   | { type: 'join'; name: string }
   | { type: 'message'; text: string }
   | { type: 'direct'; to: string; text: string }
   | { type: 'read'; peer: string }
 
-/** A private conversation replayed from PostgreSQL after a join. */
+/** Личная переписка, восстановленная из PostgreSQL после входа. */
 export interface DirectThread {
+  /** Собеседник в том написании, под которым он вошёл. */
   peer: string
+  /** Последние сообщения диалога по порядку. */
   messages: DirectMessage[]
+  /** Сколько сообщений от собеседника ещё не прочитано. */
   unread: number
 }
 
+/** Элемент ленты: обычное сообщение (общее или личное). */
 export interface ChatItem {
   kind: 'chat'
   id: string
   author: string
   text: string
   sentAt: string
-  /** Set for private messages: who the message was addressed to. */
+  /** Заполняется у личных сообщений: кому адресовано. */
   recipient?: string
 }
 
+/** Элемент ленты: системное уведомление о входе или выходе. */
 export interface SystemItem {
   kind: 'system'
   id: string
@@ -55,9 +62,10 @@ export interface SystemItem {
   at: string
 }
 
+/** Всё, что может отображаться в ленте сообщений. */
 export type TimelineItem = ChatItem | SystemItem
 
-/** A private conversation shown in the sidebar. */
+/** Краткая карточка личного диалога в боковой панели. */
 export interface ConversationSummary {
   peer: string
   unread: number
