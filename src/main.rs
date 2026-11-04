@@ -1,0 +1,69 @@
+mod config;
+mod db;
+mod protocol;
+mod routes;
+mod state;
+mod ws;
+
+use std::error::Error;
+
+use tokio::net::TcpListener;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+use crate::{config::Config, db::ChatDb, state::ChatState};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_tracing();
+
+    let config = Config::from_env()?;
+    let db = ChatDb::connect(&config.db_url).await?;
+    let state = ChatState::persisted(db).await?;
+
+    let app = routes::router(state.clone());
+
+    let listener = TcpListener::bind(config.bind_addr).await?;
+    info!(address = %config.bind_addr, "chat server is listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    state.close_storage().await;
+    info!("server stopped");
+    Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("rust_chat=info,tower_http=info"));
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("shutdown signal received");
+}
