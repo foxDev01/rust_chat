@@ -1,13 +1,18 @@
 //! Обработка WebSocket-соединений: вход по токену сессии, сообщения,
 //! личные переписки и heartbeat.
 
+use std::sync::OnceLock;
+
 use axum::{
     Json,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{
+        HeaderMap, StatusCode,
+        header::{HOST, ORIGIN},
+    },
     response::Response,
 };
 use chrono::Utc;
@@ -44,12 +49,30 @@ pub struct WsQuery {
 /// Точка входа для `GET /ws?token=...`.
 ///
 /// Соединение создаётся только для владельца действующей сессии; иначе
-/// браузер получает обычный HTTP 401 ещё до апгрейда.
+/// браузер получает обычный HTTP 401 ещё до апгрейда. Запрос с чужого
+/// `Origin` отклоняется с HTTP 403 — так чужой сайт не сможет
+/// подключиться, даже если украдёт токен из `localStorage`.
 pub async fn upgrade(
     ws: WebSocketUpgrade,
     State(state): State<ChatState>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+
+    if !origin_allowed(origin, host) {
+        warn!(
+            ?origin,
+            ?host,
+            "rejected websocket upgrade from a foreign origin"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Запрос с недопустимого Origin" })),
+        ));
+    }
+
     let token = query
         .token
         .ok_or_else(|| unauthorized("Требуется вход в аккаунт"))?;
@@ -63,6 +86,90 @@ pub async fn upgrade(
         .max_message_size(MAX_FRAME_SIZE)
         .max_frame_size(MAX_FRAME_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state, account)))
+}
+
+/// Дополнительные источники WebSocket из `CHAT_ALLOWED_ORIGINS`
+/// (через запятую), кэшируются при первом подключении.
+fn extra_allowed_origins() -> &'static [String] {
+    static ORIGINS: OnceLock<Vec<String>> = OnceLock::new();
+
+    ORIGINS
+        .get_or_init(|| {
+            std::env::var("CHAT_ALLOWED_ORIGINS")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
+/// Проверяет, что апгрейд пришёл из доверенного источника.
+///
+/// `Origin` присылают только браузеры: запрос без этого заголовка проверять
+/// нечего (на него защита от кросс-сайтовых атак и не рассчитана).
+fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    origin_allowed_in(origin, host, extra_allowed_origins())
+}
+
+/// Проверка `Origin` с явно заданным списком дополнительно разрешённых источников.
+fn origin_allowed_in(origin: Option<&str>, host: Option<&str>, extra: &[String]) -> bool {
+    let Some(origin) = origin else {
+        // Не-браузерные клиенты заголовок не шлют — их Origin защита не касается.
+        return true;
+    };
+
+    if origin.trim().eq_ignore_ascii_case("null") {
+        return false;
+    }
+
+    // Хост из `Origin` вида `scheme://хост[:порт]/путь`.
+    let Some(origin_host) = host_of(origin) else {
+        return false;
+    };
+    let origin_host = normalize_host(origin_host);
+
+    // Same-origin: браузер отдаёт страницу с того же хоста, что и сокет.
+    if let Some(host) = host
+        && normalize_host(host) == origin_host
+    {
+        return true;
+    }
+
+    // Либо источник явно разрешён конфигурацией (например, за прокси).
+    extra
+        .iter()
+        .any(|allowed| host_of(allowed).is_some_and(|value| normalize_host(value) == origin_host))
+}
+
+/// Извлекает `хост[:порт]` из `Origin`, URL или обычного адреса.
+fn host_of(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let rest = match value.split_once("://") {
+        Some((_, rest)) => rest,
+        None => value,
+    };
+
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    (!hostport.is_empty()).then_some(hostport)
+}
+
+/// Сравнивает хосты без учёта регистра и без портов по умолчанию.
+fn normalize_host(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+
+    for default_port in [":443", ":80"] {
+        if let Some(base) = host.strip_suffix(default_port) {
+            return base.to_owned();
+        }
+    }
+
+    host
 }
 
 /// Основной цикл одного соединения.
@@ -355,4 +462,77 @@ async fn send_json(sink: &mut SocketSink, message: &ServerMessage) -> Result<(),
         serde_json::to_string(message).expect("ServerMessage serialization is infallible");
 
     sink.send(Message::Text(payload.into())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_requests_without_origin() {
+        // Так подключаются тесты и не-браузерные клиенты.
+        assert!(origin_allowed_in(None, Some("localhost:3000"), &[]));
+        assert!(origin_allowed_in(None, None, &[]));
+    }
+
+    #[test]
+    fn allows_same_origin() {
+        assert!(origin_allowed_in(
+            Some("http://localhost:3000"),
+            Some("localhost:3000"),
+            &[]
+        ));
+        // Порт по умолчанию не мешает сравнению.
+        assert!(origin_allowed_in(
+            Some("https://chat.example.com"),
+            Some("chat.example.com"),
+            &[]
+        ));
+        assert!(origin_allowed_in(
+            Some("HTTPS://Chat.Example.Com"),
+            Some("chat.example.com:443"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn denies_foreign_origin() {
+        assert!(!origin_allowed_in(
+            Some("http://evil.example"),
+            Some("chat.example.com"),
+            &[]
+        ));
+        assert!(!origin_allowed_in(
+            Some("null"),
+            Some("chat.example.com"),
+            &[]
+        ));
+        assert!(!origin_allowed_in(
+            Some("http://chat.example.com"),
+            None,
+            &[]
+        ));
+        assert!(!origin_allowed_in(
+            Some("не-адрес"),
+            Some("chat.example.com"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn allows_configured_origin() {
+        let extra = ["https://chat.example.com".to_owned()];
+
+        // Клиент с другого хоста, но из разрешённого источника.
+        assert!(origin_allowed_in(
+            Some("https://chat.example.com"),
+            Some("api.internal:8080"),
+            &extra
+        ));
+        assert!(!origin_allowed_in(
+            Some("https://evil.example"),
+            Some("api.internal:8080"),
+            &extra
+        ));
+    }
 }
