@@ -295,3 +295,7 @@ npm run build
 - автоматическое переподключение с очередью недоставленных сообщений;
 - Docker-образ, TLS и reverse proxy;
 - проверка `Origin` при апгрейде до WebSocket.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).
