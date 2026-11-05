@@ -275,6 +275,12 @@ button:disabled {
   font-size: 13px;
 }
 
+.alert--success {
+  border-color: rgba(61, 220, 151, 0.3);
+  background: rgba(61, 220, 151, 0.09);
+  color: #9ff0c8;
+}
+
 .primary-button {
   display: inline-flex;
   gap: 9px;
@@ -532,6 +538,16 @@ button:disabled {
   border-top: 1px solid var(--border);
 }
 
+.sidebar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sidebar-actions .ghost-button {
+  flex: 1;
+  padding: 0 10px;
+}
+
 .status-pill {
   display: inline-flex;
   gap: 8px;
@@ -682,6 +698,72 @@ button:disabled {
 
 .banner-close:hover {
   opacity: 1;
+}
+
+/* ---------- Password modal ---------- */
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  overflow-y: auto;
+  background: rgba(5, 7, 11, 0.72);
+  backdrop-filter: blur(6px);
+  animation: fade-in 0.16s ease-out both;
+}
+
+.password-modal {
+  width: min(420px, 100%);
+  padding: 26px 26px 22px;
+  animation: card-in 0.22s ease-out both;
+}
+
+.password-modal__head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.password-modal__head h2 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.password-modal__hint {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.password-modal .field {
+  margin-bottom: 10px;
+}
+
+.password-modal .hint {
+  margin: 0 2px 12px;
+}
+
+.password-modal .alert {
+  margin-bottom: 12px;
+}
+
+.password-form__actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.password-form__actions .ghost-button {
+  padding: 0 16px;
 }
 
 .messages {

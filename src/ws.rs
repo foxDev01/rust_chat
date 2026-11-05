@@ -27,8 +27,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth::Account,
-    protocol::{ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName},
+    auth::{self, Account},
+    protocol::{
+        ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName, name_key,
+    },
     state::{ChatState, PERSONAL_QUEUE},
 };
 
@@ -81,11 +83,13 @@ pub async fn upgrade(
         .authenticate(&token)
         .await
         .ok_or_else(|| unauthorized("Сессия истекла, войдите снова"))?;
+    // Хеш нужен, чтобы при смене пароля отличить это окно от чужих устройств.
+    let token_hash = auth::token_hash(&token);
 
     Ok(ws
         .max_message_size(MAX_FRAME_SIZE)
         .max_frame_size(MAX_FRAME_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, state, account)))
+        .on_upgrade(move |socket| handle_socket(socket, state, account, token_hash)))
 }
 
 /// Дополнительные источники WebSocket из `CHAT_ALLOWED_ORIGINS`
@@ -176,7 +180,7 @@ fn normalize_host(host: &str) -> String {
 ///
 /// Параллельно обрабатываются четыре источника событий: входящие кадры,
 /// общая рассылка, личная очередь и heartbeat.
-async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
+async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, token_hash: String) {
     let id = Uuid::new_v4();
     let (mut sink, mut stream) = socket.split();
 
@@ -192,15 +196,9 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
         return;
     };
 
-    // Один аккаунт — одно активное соединение: второе окно получит ошибку.
-    let users = match state.join(id, &name, inbox).await {
-        Ok(users) => users,
-        Err(error) => {
-            let _ = send_error(&mut sink, error.message()).await;
-            let _ = sink.close().await;
-            return;
-        }
-    };
+    // Один аккаунт может быть открыт в нескольких окнах: каждое соединение
+    // живёт отдельно, а имя в списке участников показывается один раз.
+    let (users, first_window) = state.join(id, &name, &token_hash, inbox).await;
 
     // Приветствие, публичная история и личные переписки.
     if !send_initial(&mut sink, &state, &name, users).await {
@@ -209,11 +207,15 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
         return;
     }
 
-    info!(%id, %name, "user joined");
-    state.broadcast(ServerMessage::System {
-        text: format!("{name} теперь в чате"),
-        at: Utc::now(),
-    });
+    // Второе окно не считается новым входом: системное сообщение и так
+    // уже есть в истории, а список участников не изменился.
+    if first_window {
+        info!(%id, %name, "user joined");
+        state.broadcast(ServerMessage::System {
+            text: format!("{name} теперь в чате"),
+            at: Utc::now(),
+        });
+    }
     state.broadcast(ServerMessage::Users {
         users: state.users().await,
     });
@@ -271,7 +273,10 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
             personal_message = personal.recv() => {
                 match personal_message {
                     Some(event) => {
-                        if send_json(&mut sink, &event).await.is_err() {
+                        // `session_ended` — последнее событие: отправляем его
+                        // клиенту и закрываем соединение.
+                        let ended = matches!(event, ServerMessage::SessionEnded { .. });
+                        if send_json(&mut sink, &event).await.is_err() || ended {
                             break;
                         }
                     }
@@ -287,13 +292,18 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account) {
         }
     }
 
-    // Сообщаем остальным, что участник вышел.
-    if let Some(name) = state.leave(id).await {
-        info!(%id, %name, "user left");
-        state.broadcast(ServerMessage::System {
-            text: format!("{name} больше не в чате"),
-            at: Utc::now(),
-        });
+    // Сообщаем остальным, что участник вышел. Если у него открыто ещё одно
+    // окно, он по-прежнему в чате — системное сообщение не отправляем.
+    if let Some((name, still_online)) = state.leave(id).await {
+        if still_online {
+            debug!(%id, %name, "window closed, user is still online");
+        } else {
+            info!(%id, %name, "user left");
+            state.broadcast(ServerMessage::System {
+                text: format!("{name} больше не в чате"),
+                at: Utc::now(),
+            });
+        }
         state.broadcast(ServerMessage::Users {
             users: state.users().await,
         });
@@ -388,19 +398,21 @@ async fn handle_text(
             };
 
             // Личные сообщения доставляются только тем, кто сейчас онлайн.
-            let Some((recipient_id, recipient_name)) = state.find_user(recipient.as_str()).await
-            else {
+            // У получателя может быть открыто несколько окон — шлём в каждое.
+            let connections = state.connections(recipient.as_str()).await;
+            let Some((_, recipient_name)) = connections.first() else {
                 return send_error(sink, "Пользователь не в сети").await;
             };
 
-            if recipient_id == id {
+            // Имена уникальны без учёта регистра, поэтому это и есть «себе».
+            if name_key(recipient.as_str()) == name_key(author.as_str()) {
                 return send_error(sink, "Нельзя отправить личное сообщение самому себе").await;
             }
 
             let message = DirectMessage {
                 id: Uuid::new_v4(),
                 from: author.to_string(),
-                to: recipient_name,
+                to: recipient_name.clone(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
             };
@@ -409,20 +421,46 @@ async fn handle_text(
             // сообщение, которое клиент уже получил.
             state.save_direct(&message).await;
 
-            if !state
-                .send_to(
-                    recipient_id,
-                    ServerMessage::Direct {
-                        message: message.clone(),
-                    },
-                )
-                .await
-            {
+            let mut delivered = 0;
+            for (connection_id, _) in &connections {
+                if *connection_id == id {
+                    continue;
+                }
+
+                if state
+                    .send_to(
+                        *connection_id,
+                        ServerMessage::Direct {
+                            message: message.clone(),
+                        },
+                    )
+                    .await
+                {
+                    delivered += 1;
+                }
+            }
+
+            if delivered == 0 {
                 return send_error(sink, "Не удалось доставить сообщение").await;
             }
 
-            // Копию отправителю шлём в его же сокет; получатель уже получил
-            // свою копию через личную очередь.
+            // Копию отправителю шлём в его текущий сокет, а остальным окнам
+            // того же аккаунта — через их личные очереди.
+            for (connection_id, _) in state.connections(author.as_str()).await {
+                if connection_id == id {
+                    continue;
+                }
+
+                state
+                    .send_to(
+                        connection_id,
+                        ServerMessage::Direct {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+            }
+
             send_json(sink, &ServerMessage::Direct { message })
                 .await
                 .is_ok()

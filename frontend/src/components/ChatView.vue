@@ -14,6 +14,9 @@ const props = defineProps<{
   activePeer: string | null
   status: ConnectionStatus
   error: string
+  passwordBusy: boolean
+  passwordError: string
+  passwordNotice: string
 }>()
 
 // События наружу: отправка сообщения, выбор диалога, выход и переподключение.
@@ -22,6 +25,8 @@ const emit = defineEmits<{
   openConversation: [peer: string | null]
   leave: []
   reconnect: []
+  changePassword: [current: string, next: string]
+  clearPasswordStatus: []
   dismissError: []
 }>()
 
@@ -40,6 +45,33 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 // Прижата ли лента к низу: если пользователь листает историю, не дёргаем её.
 const pinnedToBottom = ref(true)
 const sidebarOpen = ref(false)
+
+// Форма смены пароля. Поля живут в компоненте, а запрос выполняет хук чата.
+const passwordOpen = ref(false)
+const currentPassword = ref('')
+const newPassword = ref('')
+const passwordConfirmation = ref('')
+const passwordTouched = ref(false)
+
+// Локальные проверки до отправки: сервер проверит пароль ещё раз.
+const passwordLocalError = computed(() => {
+  if (!passwordTouched.value) {
+    return ''
+  }
+  if (!currentPassword.value) {
+    return 'Введите текущий пароль'
+  }
+  if ([...newPassword.value].length < 8) {
+    return 'Новый пароль должен быть не короче 8 символов'
+  }
+  if (newPassword.value !== passwordConfirmation.value) {
+    return 'Пароли не совпадают'
+  }
+  if (newPassword.value === currentPassword.value) {
+    return 'Новый пароль совпадает с текущим'
+  }
+  return ''
+})
 
 // Открыт личный диалог (иначе показан общий канал).
 const isDirect = computed(() => props.activePeer !== null)
@@ -194,6 +226,34 @@ function open(peer: string | null) {
   emit('openConversation', peer)
 }
 
+/** Открывает форму смены пароля и убирает старые сообщения. */
+function openPasswordForm() {
+  passwordOpen.value = true
+  passwordTouched.value = false
+  emit('clearPasswordStatus')
+}
+
+/** Закрывает форму и очищает введённые пароли. */
+function closePasswordForm() {
+  passwordOpen.value = false
+  currentPassword.value = ''
+  newPassword.value = ''
+  passwordConfirmation.value = ''
+  passwordTouched.value = false
+  emit('clearPasswordStatus')
+}
+
+/** Проверяет форму и отправляет запрос на смену пароля. */
+function submitPassword() {
+  passwordTouched.value = true
+
+  if (passwordLocalError.value || props.passwordBusy) {
+    return
+  }
+
+  emit('changePassword', currentPassword.value, newPassword.value)
+}
+
 /** Отправляет черновик и возвращает ленту к низу. */
 function submit() {
   if (!canSend.value) {
@@ -240,6 +300,21 @@ watch(
     }
     await nextTick()
     scrollToBottom()
+  },
+)
+
+// После успешной смены пароля поля больше не нужны: пароль уже не тот.
+watch(
+  () => props.passwordNotice,
+  (notice) => {
+    if (!notice) {
+      return
+    }
+
+    currentPassword.value = ''
+    newPassword.value = ''
+    passwordConfirmation.value = ''
+    passwordTouched.value = false
   },
 )
 
@@ -326,7 +401,10 @@ onMounted(async () => {
           <span class="status-dot"></span>
           {{ STATUS_LABELS[status] }}
         </span>
-        <button class="ghost-button" type="button" @click="emit('leave')">Выйти</button>
+        <div class="sidebar-actions">
+          <button class="ghost-button" type="button" @click="openPasswordForm">Пароль</button>
+          <button class="ghost-button" type="button" @click="emit('leave')">Выйти</button>
+        </div>
       </div>
     </aside>
 
@@ -419,6 +497,89 @@ onMounted(async () => {
       </form>
 
       <p class="composer-hint">{{ composerHint }}</p>
+    </div>
+
+    <!-- Модальное окно смены пароля. -->
+    <div v-if="passwordOpen" class="modal-backdrop" @click.self="closePasswordForm">
+      <section
+        class="login-card password-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="password-title"
+      >
+        <header class="password-modal__head">
+          <h2 id="password-title">Смена пароля</h2>
+          <button
+            class="banner-close"
+            type="button"
+            aria-label="Закрыть"
+            @click="closePasswordForm"
+          >
+            ×
+          </button>
+        </header>
+
+        <p class="password-modal__hint">
+          После смены пароля остальные устройства выйдут из аккаунта, а это окно
+          останется подключённым.
+        </p>
+
+        <form class="login-form" @submit.prevent="submitPassword">
+          <div class="field">
+            <label for="password-current">Текущий пароль</label>
+            <input
+              id="password-current"
+              v-model="currentPassword"
+              type="password"
+              maxlength="128"
+              autocomplete="current-password"
+              :disabled="passwordBusy"
+            />
+          </div>
+
+          <div class="field">
+            <label for="password-new">Новый пароль</label>
+            <input
+              id="password-new"
+              v-model="newPassword"
+              type="password"
+              maxlength="128"
+              autocomplete="new-password"
+              placeholder="Не короче 8 символов"
+              :disabled="passwordBusy"
+            />
+          </div>
+
+          <div class="field">
+            <label for="password-confirm">Повторите новый пароль</label>
+            <input
+              id="password-confirm"
+              v-model="passwordConfirmation"
+              type="password"
+              maxlength="128"
+              autocomplete="new-password"
+              :disabled="passwordBusy"
+            />
+          </div>
+
+          <p v-if="passwordLocalError" class="hint hint--error">{{ passwordLocalError }}</p>
+          <p v-if="passwordError" class="alert">{{ passwordError }}</p>
+          <p v-if="passwordNotice" class="alert alert--success">{{ passwordNotice }}</p>
+
+          <div class="password-form__actions">
+            <button class="ghost-button" type="button" @click="closePasswordForm">
+              Отмена
+            </button>
+            <button
+              class="primary-button primary-button--small"
+              type="submit"
+              :disabled="passwordBusy"
+            >
+              {{ passwordBusy ? 'Меняем…' : 'Сменить пароль' }}
+            </button>
+          </div>
+        </form>
+      </section>
     </div>
   </section>
 </template>

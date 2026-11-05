@@ -164,6 +164,8 @@ pub enum ServerMessage {
     Users { users: Vec<String> },
     /// Ошибка, которую нужно показать пользователю.
     Error { message: String },
+    /// Сервер завершил сессию: например, пароль сменили на другом устройстве.
+    SessionEnded { reason: String },
 }
 
 #[cfg(test)]

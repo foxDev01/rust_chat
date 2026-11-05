@@ -4,20 +4,28 @@
 //! токен сессии. В базе лежит SHA-256 от токена, поэтому утечка таблицы
 //! `sessions` не даёт готовых токенов для входа.
 
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::OnceLock,
+    time::Duration,
+};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json,
-    extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    extract::{ConnectInfo, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, RETRY_AFTER},
+    },
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{protocol::UserName, state::ChatState};
@@ -50,6 +58,10 @@ pub enum AuthError {
     UsernameTaken,
     /// Неверная пара имя/пароль (без подсказки, что именно не так).
     InvalidCredentials,
+    /// Токен сессии отсутствует в базе или уже истёк.
+    Unauthorized,
+    /// Текущий пароль при смене пароля не совпал.
+    WrongPassword,
     /// Аккаунты недоступны, потому что сервер запущен без базы.
     Unavailable,
     /// Непредвиденная ошибка хранилища.
@@ -62,6 +74,8 @@ impl AuthError {
         match self {
             Self::UsernameTaken => "Это имя уже занято",
             Self::InvalidCredentials => "Неверное имя или пароль",
+            Self::Unauthorized => "Сессия истекла, войдите снова",
+            Self::WrongPassword => "Неверный текущий пароль",
             Self::Unavailable => "Хранилище аккаунтов недоступно",
             Self::Internal(_) => "Внутренняя ошибка сервера",
         }
@@ -73,6 +87,13 @@ impl AuthError {
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+/// Тело запроса `/api/password`.
+#[derive(Debug, Deserialize)]
+pub struct PasswordChange {
+    pub current_password: String,
+    pub new_password: String,
 }
 
 /// Публичные данные пользователя.
@@ -98,13 +119,40 @@ pub struct AuthResponse {
     pub user: UserView,
 }
 
-type ApiError = (StatusCode, Json<Value>);
+/// Ошибка API в едином формате `{ "error": "..." }`.
+///
+/// Для ответов `429` дополнительно выставляется заголовок `Retry-After`,
+/// чтобы клиент знал, через сколько секунд можно повторить запрос.
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+    retry_after: Option<u64>,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+
+        if let Some(seconds) = self.retry_after {
+            response.headers_mut().insert(RETRY_AFTER, seconds.into());
+        }
+
+        response
+    }
+}
 
 /// `POST /api/register` — создаёт аккаунт и сразу открывает сессию.
 pub async fn register(
     State(state): State<ChatState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    state
+        .check_register_rate(client_ip(addr, &headers))
+        .await
+        .map_err(|wait| rate_limited(wait, "регистрации"))?;
+
     let username = UserName::parse(&credentials.username)
         .map_err(|reason| api_error(StatusCode::BAD_REQUEST, reason))?;
     validate_password(&credentials.password)
@@ -124,8 +172,15 @@ pub async fn register(
 /// `POST /api/login` — проверяет пароль и открывает новую сессию.
 pub async fn login(
     State(state): State<ChatState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    state
+        .check_login_rate(client_ip(addr, &headers))
+        .await
+        .map_err(|wait| rate_limited(wait, "входа"))?;
+
     let session = state
         .login(&credentials.username, &credentials.password)
         .await
@@ -160,6 +215,34 @@ pub async fn logout(State(state): State<ChatState>, headers: HeaderMap) -> Statu
     }
 
     StatusCode::NO_CONTENT
+}
+
+/// `POST /api/password` — меняет пароль и отзывает остальные сессии аккаунта.
+pub async fn change_password(
+    State(state): State<ChatState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasswordChange>,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer_token(&headers)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Требуется вход"))?;
+
+    validate_password(&body.new_password)
+        .map_err(|reason| api_error(StatusCode::BAD_REQUEST, reason))?;
+
+    // Проверка текущего пароля тоже считается попыткой входа: без лимита
+    // его можно было бы подбирать с украденным токеном.
+    state
+        .check_login_rate(client_ip(addr, &headers))
+        .await
+        .map_err(|wait| rate_limited(wait, "смены пароля"))?;
+
+    state
+        .change_password(&token, &body.current_password, &body.new_password)
+        .await
+        .map_err(auth_api_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Проверяет пароль перед хешированием.
@@ -245,9 +328,77 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+/// IP клиента для лимитов.
+///
+/// За reverse proxy реальный адрес приходит в `X-Forwarded-For`, но доверять
+/// этому заголовку можно только когда прокси действительно есть: иначе любой
+/// клиент подделает адрес и обойдёт лимит. Включается через `CHAT_TRUST_PROXY`.
+fn client_ip(addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    client_ip_in(trust_proxy(), addr, headers)
+}
+
+/// Проверка IP с явно заданным доверием к прокси (удобно тестировать).
+fn client_ip_in(trust_proxy: bool, addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if !trust_proxy {
+        return addr.ip();
+    }
+
+    forwarded_ip(headers, "x-forwarded-for")
+        .or_else(|| forwarded_ip(headers, "x-real-ip"))
+        .unwrap_or_else(|| addr.ip())
+}
+
+/// Первый адрес из заголовка прокси.
+fn forwarded_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Читает `CHAT_TRUST_PROXY` один раз за запуск.
+fn trust_proxy() -> bool {
+    static TRUST: OnceLock<bool> = OnceLock::new();
+
+    *TRUST.get_or_init(|| {
+        std::env::var("CHAT_TRUST_PROXY")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Ответ с ошибкой в едином для API формате.
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
-    (status, Json(json!({ "error": message.into() })))
+    ApiError {
+        status,
+        message: message.into(),
+        retry_after: None,
+    }
+}
+
+/// Ответ `429 Too Many Requests` с подсказкой, сколько ждать.
+fn rate_limited(wait: Duration, action: &str) -> ApiError {
+    let seconds = wait.as_secs().max(1);
+
+    if seconds > 1 {
+        warn!(seconds, %action, "too many authentication attempts");
+    }
+
+    ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message: format!("Слишком много попыток {action}. Повторите через {seconds} с."),
+        retry_after: Some(seconds),
+    }
 }
 
 /// Преобразует доменную ошибку в HTTP-ответ.
@@ -255,6 +406,8 @@ fn auth_api_error(error: AuthError) -> ApiError {
     let status = match &error {
         AuthError::UsernameTaken => StatusCode::CONFLICT,
         AuthError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+        AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+        AuthError::WrongPassword => StatusCode::BAD_REQUEST,
         AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         AuthError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -296,5 +449,23 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert_eq!(token_hash(&first).len(), 64);
         assert_ne!(token_hash(&first), token_hash(&second));
+    }
+
+    #[test]
+    fn honours_forwarded_ip_only_behind_a_trusted_proxy() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+
+        // Без доверия к прокси заголовок игнорируется: его легко подделать.
+        assert_eq!(client_ip_in(false, peer, &headers), peer.ip());
+        // С доверием берётся первый адрес в цепочке.
+        assert_eq!(
+            client_ip_in(true, peer, &headers),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+
+        // Если заголовка нет, остаётся адрес TCP-соединения.
+        assert_eq!(client_ip_in(true, peer, &HeaderMap::new()), peer.ip());
     }
 }

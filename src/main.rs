@@ -7,11 +7,12 @@ mod auth;
 mod config;
 mod db;
 mod protocol;
+mod rate_limit;
 mod routes;
 mod state;
 mod ws;
 
-use std::error::Error;
+use std::{error::Error, net::SocketAddr};
 
 use tokio::net::TcpListener;
 use tracing::info;
@@ -38,9 +39,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(address = %config.bind_addr, "chat server is listening");
 
     // Сервер работает до Ctrl+C или SIGTERM, затем закрывает соединения.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // ConnectInfo передаёт обработчикам IP клиента: по нему считается лимит
+    // попыток входа и регистрации.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // Корректно закрываем пул соединений с базой.
     state.close_storage().await;

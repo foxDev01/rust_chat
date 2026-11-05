@@ -14,11 +14,16 @@ const {
   activeTimeline,
   error,
   joined,
+  passwordBusy,
+  passwordError,
+  passwordNotice,
   connect,
   reconnect,
   leave,
   post,
   openConversation,
+  changePassword,
+  clearPasswordStatus,
   dismissError,
 } = useChat()
 </script>
@@ -44,10 +49,15 @@ const {
         :active-peer="activePeer"
         :status="status"
         :error="error"
+        :password-busy="passwordBusy"
+        :password-error="passwordError"
+        :password-notice="passwordNotice"
         @send="post"
         @open-conversation="openConversation"
         @leave="leave"
         @reconnect="reconnect"
+        @change-password="changePassword"
+        @clear-password-status="clearPasswordStatus"
         @dismiss-error="dismissError"
       />
     </Transition>

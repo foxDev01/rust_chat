@@ -45,6 +45,7 @@ fn api_router() -> Router<ChatState> {
         .route("/login", post(auth::login))
         .route("/me", get(auth::me))
         .route("/logout", post(auth::logout))
+        .route("/password", post(auth::change_password))
         .fallback(api_not_found)
 }
 

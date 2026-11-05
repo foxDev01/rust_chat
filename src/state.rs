@@ -5,7 +5,9 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    net::IpAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -17,6 +19,7 @@ use crate::db::{ChatDb, THREAD_REPLAY};
 use crate::protocol::{
     ChatMessage, DirectMessage, DirectThread, ServerMessage, UserName, name_key,
 };
+use crate::rate_limit::{LOGIN_QUOTA, REGISTER_QUOTA, RateLimiter};
 
 /// Сколько последних сообщений получает новый клиент при подключении.
 pub const HISTORY_LIMIT: usize = 100;
@@ -40,31 +43,23 @@ struct Inner {
     users: RwLock<BTreeMap<Uuid, User>>,
     /// Ограниченная история общего канала (не более [`HISTORY_LIMIT`] сообщений).
     history: RwLock<VecDeque<ChatMessage>>,
+    /// Лимиты попыток входа и регистрации по IP-адресу.
+    login_limiter: RateLimiter,
+    register_limiter: RateLimiter,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
     db: Option<ChatDb>,
 }
 
 struct User {
     name: String,
+    /// Хеш токена сессии, по которому открыто это окно.
+    ///
+    /// Нужен, чтобы при смене пароля отключить чужие устройства, но оставить
+    /// окна, работающие с тем же токеном.
+    token_hash: String,
     /// Личные сообщения кладутся сюда, а не в общий broadcast-канал,
     /// чтобы их содержимое не уходило другим соединениям.
     inbox: mpsc::Sender<ServerMessage>,
-}
-
-/// Ошибки, которые могут возникнуть при входе в чат.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinError {
-    /// Имя уже занято другим участником (сравнение без учёта регистра).
-    NameTaken,
-}
-
-impl JoinError {
-    /// Текст ошибки для отправки клиенту.
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::NameTaken => "Это имя уже занято",
-        }
-    }
 }
 
 impl ChatState {
@@ -99,6 +94,8 @@ impl ChatState {
                 events,
                 users: RwLock::new(BTreeMap::new()),
                 history: RwLock::new(VecDeque::with_capacity(HISTORY_LIMIT)),
+                login_limiter: RateLimiter::new(LOGIN_QUOTA),
+                register_limiter: RateLimiter::new(REGISTER_QUOTA),
                 db,
             }),
         }
@@ -169,6 +166,16 @@ impl ChatState {
             .flatten()
     }
 
+    /// Проверяет лимит попыток входа с указанного IP-адреса.
+    pub async fn check_login_rate(&self, ip: IpAddr) -> Result<(), Duration> {
+        self.inner.login_limiter.check(ip).await
+    }
+
+    /// Проверяет лимит попыток регистрации с указанного IP-адреса.
+    pub async fn check_register_rate(&self, ip: IpAddr) -> Result<(), Duration> {
+        self.inner.register_limiter.check(ip).await
+    }
+
     /// Отзывает сессию (выход из аккаунта).
     pub async fn logout(&self, token: &str) {
         if let Some(db) = &self.inner.db
@@ -194,6 +201,62 @@ impl ChatState {
         Ok(AuthSession { token, account })
     }
 
+    /// Меняет пароль владельца сессии.
+    ///
+    /// После успешной смены все остальные сессии аккаунта отзываются:
+    /// сохранённый где-то ещё токен перестаёт работать, а текущее устройство
+    /// остаётся в чате и не требует повторного входа.
+    pub async fn change_password(
+        &self,
+        token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), AuthError> {
+        let db = self.inner.db.as_ref().ok_or(AuthError::Unavailable)?;
+        let token_hash = auth::token_hash(token);
+
+        let account = db
+            .find_account_by_token(&token_hash)
+            .await
+            .map_err(storage_error)?
+            .ok_or(AuthError::Unauthorized)?;
+
+        let Some((_, hash)) = db
+            .find_account_by_key(&name_key(&account.username))
+            .await
+            .map_err(storage_error)?
+        else {
+            return Err(AuthError::Internal(
+                "аккаунт пропал из таблицы accounts".to_owned(),
+            ));
+        };
+
+        // Текущий пароль обязателен: одного украденного токена недостаточно,
+        // чтобы полностью завладеть аккаунтом.
+        if !auth::verify_password_async(current_password.to_owned(), hash).await {
+            return Err(AuthError::WrongPassword);
+        }
+
+        let hash = auth::hash_password_async(new_password.to_owned())
+            .await
+            .map_err(AuthError::Internal)?;
+
+        db.update_password(account.id, &hash)
+            .await
+            .map_err(storage_error)?;
+        // Остальные сессии отзываем уже после смены хеша.
+        db.delete_other_sessions(account.id, &token_hash)
+            .await
+            .map_err(storage_error)?;
+
+        // И сразу закрываем их открытые WebSocket-соединения: недостаточно
+        // просто удалить токен, если украденное соединение уже установлено.
+        self.end_other_sessions(&account.username, &token_hash)
+            .await;
+
+        Ok(())
+    }
+
     /// Новый получатель широковещательных событий: у каждого соединения он свой.
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMessage> {
         self.inner.events.subscribe()
@@ -205,59 +268,100 @@ impl ChatState {
         let _ = self.inner.events.send(message);
     }
 
-    /// Регистрирует пользователя и возвращает отсортированный список участников.
+    /// Регистрирует соединение и возвращает список участников.
     ///
-    /// Имя сравнивается без учёта регистра, поэтому «Анна» и «анна» — одно и то же.
+    /// Один аккаунт может быть открыт в нескольких окнах: каждое соединение
+    /// получает свой id, а в списке участников имя показывается один раз.
+    /// Второй элемент результата — `true`, если это первое соединение имени.
     pub async fn join(
         &self,
         id: Uuid,
         name: &UserName,
+        token_hash: &str,
         inbox: mpsc::Sender<ServerMessage>,
-    ) -> Result<Vec<String>, JoinError> {
+    ) -> (Vec<String>, bool) {
         let mut users = self.inner.users.write().await;
 
         let key = name_key(name.as_str());
-        if users.values().any(|user| name_key(&user.name) == key) {
-            return Err(JoinError::NameTaken);
-        }
+        let first = !users.values().any(|user| name_key(&user.name) == key);
 
         users.insert(
             id,
             User {
                 name: name.as_str().to_owned(),
+                token_hash: token_hash.to_owned(),
                 inbox,
             },
         );
-        Ok(sorted_names(&users))
+
+        (sorted_names(&users), first)
     }
 
-    /// Удаляет пользователя при отключении и возвращает его имя, если он был в чате.
-    pub async fn leave(&self, id: Uuid) -> Option<String> {
-        self.inner
-            .users
-            .write()
-            .await
-            .remove(&id)
-            .map(|user| user.name)
+    /// Удаляет соединение.
+    ///
+    /// Возвращает имя и признак того, что пользователь остался онлайн
+    /// в другом окне.
+    pub async fn leave(&self, id: Uuid) -> Option<(String, bool)> {
+        let mut users = self.inner.users.write().await;
+        let user = users.remove(&id)?;
+
+        let key = name_key(&user.name);
+        let still_online = users.values().any(|other| name_key(&other.name) == key);
+
+        Some((user.name, still_online))
     }
 
     /// Имена участников онлайн, отсортированные без учёта регистра.
+    ///
+    /// Несколько окон одного аккаунта дают одно имя в списке.
     pub async fn users(&self) -> Vec<String> {
         let users = self.inner.users.read().await;
         sorted_names(&users)
     }
 
-    /// Находит участника по имени без учёта регистра.
+    /// Все соединения пользователя с указанным именем (без учёта регистра).
     ///
-    /// Возвращает id соединения и имя в том написании, в котором пользователь вошёл.
-    pub async fn find_user(&self, name: &str) -> Option<(Uuid, String)> {
+    /// Личное сообщение доставляется в каждое открытое окно получателя.
+    pub async fn connections(&self, name: &str) -> Vec<(Uuid, String)> {
         let key = name_key(name);
         let users = self.inner.users.read().await;
 
         users
             .iter()
-            .find(|(_, user)| name_key(&user.name) == key)
+            .filter(|(_, user)| name_key(&user.name) == key)
             .map(|(id, user)| (*id, user.name.clone()))
+            .collect()
+    }
+
+    /// Завершает все соединения пользователя, открытые с других токенов.
+    ///
+    /// Вызывается после смены пароля: окна с тем же токеном остаются в чате,
+    /// а чужие устройства получают `session_ended` и закрывают соединение.
+    pub async fn end_other_sessions(&self, name: &str, keep_token_hash: &str) {
+        let key = name_key(name);
+
+        // Собираем отправители под блокировкой, а отправляем уже без неё.
+        let targets: Vec<mpsc::Sender<ServerMessage>> = self
+            .inner
+            .users
+            .read()
+            .await
+            .values()
+            .filter(|user| name_key(&user.name) == key && user.token_hash != keep_token_hash)
+            .map(|user| user.inbox.clone())
+            .collect();
+
+        for inbox in targets {
+            let message = ServerMessage::SessionEnded {
+                reason: "Пароль изменён на другом устройстве. Войдите снова.".to_owned(),
+            };
+
+            // Не ждём медленного клиента: смена пароля не должна зависать
+            // из-за переполненной очереди чужого соединения.
+            if inbox.try_send(message).is_err() {
+                warn!("failed to end a stale session: client queue is full");
+            }
+        }
     }
 
     /// Доставляет сообщение одному соединению.
@@ -378,10 +482,11 @@ fn storage_error(error: sqlx::Error) -> AuthError {
     AuthError::Internal(error.to_string())
 }
 
-/// Собирает имена участников и сортирует их без учёта регистра.
+/// Собирает уникальные имена участников и сортирует их без учёта регистра.
 fn sorted_names(users: &BTreeMap<Uuid, User>) -> Vec<String> {
     let mut names: Vec<String> = users.values().map(|user| user.name.clone()).collect();
     names.sort_by_cached_key(|name| name_key(name));
+    names.dedup_by(|first, second| name_key(first) == name_key(second));
     names
 }
 
@@ -420,19 +525,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_duplicate_names_ignoring_case() {
+    async fn allows_multiple_windows_for_one_account() {
+        let state = ChatState::new();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+
+        let (users, is_first) = state.join(first, &text("Анна"), "token-a", inbox()).await;
+        assert!(is_first);
+        assert_eq!(users, ["Анна"]);
+
+        // Второе окно того же аккаунта не создаёт вторую строку в списке.
+        let (users, is_first) = state.join(second, &text("Анна"), "token-a", inbox()).await;
+        assert!(!is_first);
+        assert_eq!(users, ["Анна"]);
+
+        // Закрытие одного окна не считается выходом из чата.
+        assert_eq!(state.leave(first).await, Some(("Анна".to_owned(), true)));
+        assert_eq!(state.leave(second).await, Some(("Анна".to_owned(), false)));
+    }
+
+    #[tokio::test]
+    async fn ends_only_sessions_with_another_token() {
         let state = ChatState::new();
 
-        assert!(
-            state
-                .join(Uuid::new_v4(), &text("Анна"), inbox())
-                .await
-                .is_ok()
-        );
-        assert_eq!(
-            state.join(Uuid::new_v4(), &text("анна"), inbox()).await,
-            Err(JoinError::NameTaken)
-        );
+        let (own_inbox, mut own_messages) = mpsc::channel(PERSONAL_QUEUE);
+        state
+            .join(Uuid::new_v4(), &text("Анна"), "token-a", own_inbox)
+            .await;
+
+        let (other_inbox, mut other_messages) = mpsc::channel(PERSONAL_QUEUE);
+        state
+            .join(Uuid::new_v4(), &text("Анна"), "token-b", other_inbox)
+            .await;
+
+        state.end_other_sessions("анна", "token-a").await;
+
+        // Чужое устройство получило команду закрыть соединение.
+        assert!(matches!(
+            other_messages.try_recv(),
+            Ok(ServerMessage::SessionEnded { .. })
+        ));
+        // Окно, с которого меняли пароль, продолжает работать.
+        assert!(own_messages.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -441,11 +575,11 @@ mod tests {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
-        state.join(first, &text("яблоко"), inbox()).await.unwrap();
-        state.join(second, &text("Банан"), inbox()).await.unwrap();
+        state.join(first, &text("яблоко"), "token-a", inbox()).await;
+        state.join(second, &text("Банан"), "token-b", inbox()).await;
         assert_eq!(state.users().await, ["Банан", "яблоко"]);
 
-        assert_eq!(state.leave(first).await.as_deref(), Some("яблоко"));
+        assert_eq!(state.leave(first).await, Some(("яблоко".to_owned(), false)));
         assert_eq!(state.users().await, ["Банан"]);
         assert_eq!(state.leave(first).await, None);
     }
@@ -456,18 +590,17 @@ mod tests {
         let alice = Uuid::new_v4();
         let bob = Uuid::new_v4();
 
-        state.join(alice, &text("Алиса"), inbox()).await.unwrap();
+        state.join(alice, &text("Алиса"), "token-a", inbox()).await;
         let (bob_inbox, mut bob_messages) = mpsc::channel(PERSONAL_QUEUE);
-        state.join(bob, &text("Боб"), bob_inbox).await.unwrap();
+        state.join(bob, &text("Боб"), "token-b", bob_inbox).await;
 
-        let (found_id, found_name) = state.find_user("боб").await.expect("user is online");
-        assert_eq!(found_id, bob);
-        assert_eq!(found_name, "Боб");
+        let connections = state.connections("боб").await;
+        assert_eq!(connections, [(bob, "Боб".to_owned())]);
 
         let message = direct("Алиса", "Боб", "привет");
         assert!(
             state
-                .send_to(found_id, ServerMessage::Direct { message })
+                .send_to(connections[0].0, ServerMessage::Direct { message })
                 .await
         );
 
@@ -484,7 +617,7 @@ mod tests {
     async fn rejects_delivery_to_unknown_users() {
         let state = ChatState::new();
 
-        assert!(state.find_user("Никого").await.is_none());
+        assert!(state.connections("Никого").await.is_empty());
         assert!(
             !state
                 .send_to(

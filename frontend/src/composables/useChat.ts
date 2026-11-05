@@ -129,6 +129,13 @@ export function useChat() {
   /** Текст последней ошибки, которую нужно показать пользователю. */
   const error = ref('')
 
+  /** Идёт ли запрос на смену пароля. */
+  const passwordBusy = ref(false)
+  /** Ошибка формы смены пароля. */
+  const passwordError = ref('')
+  /** Сообщение об успешной смене пароля. */
+  const passwordNotice = ref('')
+
   /** Вошёл ли пользователь в чат. */
   const joined = computed(() => me.value !== '')
 
@@ -336,6 +343,14 @@ export function useChat() {
           status.value = 'idle'
         }
         break
+
+      // Сервер завершил сессию (например, пароль сменили на другом устройстве).
+      case 'session_ended':
+        closeSocket()
+        clearSession()
+        error.value = message.reason
+        status.value = 'idle'
+        break
     }
   }
 
@@ -489,6 +504,53 @@ export function useChat() {
     openSocket()
   }
 
+  /**
+   * Меняет пароль текущего аккаунта.
+   *
+   * Сервер требует текущий пароль и после успешной смены отзывает остальные
+   * сессии, поэтому текущему окну повторно входить не нужно.
+   */
+  async function changePassword(currentPassword: string, newPassword: string): Promise<boolean> {
+    const currentToken = token.value
+    passwordError.value = ''
+    passwordNotice.value = ''
+
+    if (!currentToken) {
+      passwordError.value = 'Требуется вход'
+      return false
+    }
+
+    passwordBusy.value = true
+    try {
+      await api<void>('/api/password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders(currentToken),
+        },
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      })
+
+      passwordNotice.value = 'Пароль изменён. Остальные сеансы завершены.'
+      return true
+    } catch (cause) {
+      passwordError.value =
+        cause instanceof Error ? cause.message : 'Не удалось сменить пароль'
+      return false
+    } finally {
+      passwordBusy.value = false
+    }
+  }
+
+  /** Убирает сообщения формы смены пароля. */
+  function clearPasswordStatus() {
+    passwordError.value = ''
+    passwordNotice.value = ''
+  }
+
   /** Выходит из аккаунта: отзывает сессию и очищает состояние. */
   function leave() {
     const currentToken = token.value
@@ -553,11 +615,16 @@ export function useChat() {
     activeTimeline,
     error,
     joined,
+    passwordBusy,
+    passwordError,
+    passwordNotice,
     connect,
     reconnect,
     leave,
     post,
     openConversation,
+    changePassword,
+    clearPasswordStatus,
     dismissError,
   }
 }

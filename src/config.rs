@@ -1,7 +1,8 @@
 //! Конфигурация сервера, читаемая из переменных окружения.
 //!
 //! - `CHAT_BIND` — адрес и порт прослушивания (по умолчанию `0.0.0.0:3000`);
-//! - `CHAT_DB_URL` — обязательная строка подключения к PostgreSQL.
+//! - `CHAT_DB_URL` — обязательная строка подключения к PostgreSQL;
+//! - `CHAT_ALLOWED_ORIGINS`, `CHAT_TRUST_PROXY` читаются модулями `ws` и `auth`.
 
 use std::{env, error::Error, net::SocketAddr};
 

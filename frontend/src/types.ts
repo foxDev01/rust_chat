@@ -25,6 +25,7 @@ export type ServerMessage =
   | { type: 'system'; text: string; at: string }
   | { type: 'users'; users: string[] }
   | { type: 'error'; message: string }
+  | { type: 'session_ended'; reason: string }
 
 /** Сообщения, которые клиент отправляет серверу на Rust. */
 export type ClientMessage =

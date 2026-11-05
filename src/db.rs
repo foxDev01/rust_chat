@@ -167,6 +167,39 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Заменяет хеш пароля аккаунта.
+    pub async fn update_password(
+        &self,
+        account_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+            .bind(account_id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Отзывает все сессии аккаунта, кроме текущей.
+    ///
+    /// Нужно после смены пароля: если токен успели украсть, он перестанет
+    /// работать, а устройство, на котором пароль меняли, останется в чате.
+    pub async fn delete_other_sessions(
+        &self,
+        account_id: Uuid,
+        keep_token_hash: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sessions WHERE account_id = $1 AND token_hash <> $2")
+            .bind(account_id)
+            .bind(keep_token_hash)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
     /// Удаляет истёкшие сессии, чтобы таблица не росла бесконечно.
     pub async fn purge_expired_sessions(&self) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM sessions WHERE expires_at <= now()")
