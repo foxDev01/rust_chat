@@ -1,7 +1,9 @@
 //! Хранилище PostgreSQL: публичная история, личные переписки и отметки о прочтении.
 //!
-//! Схема описана в `migrations/001_init.sql` и применяется при каждом старте;
-//! все команды идемпотентны, поэтому сервер можно запускать на готовой базе.
+//! Схема описана в `migrations/` и применяется при каждом старте; все команды
+//! идемпотентны, поэтому сервер можно запускать на готовой базе. Сообщения
+//! ссылаются на аккаунты по UUID: имя пользователя используется только для
+//! показа и подтягивается из `accounts` при чтении.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -51,11 +53,19 @@ impl ChatDb {
                 )
             })?;
 
-        // Схема применяется целиком; повторный запуск ничего не ломает.
-        sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
-            .execute(&pool)
-            .await
-            .map_err(|error| format!("Не применить схему чата в PostgreSQL: {error}"))?;
+        // Схема применяется по порядку номеров; повторный запуск ничего не ломает.
+        // 002 переводит базы, созданные до появления account_id, на UUID.
+        for migration in [
+            include_str!("../migrations/001_init.sql"),
+            include_str!("../migrations/002_account_ids.sql"),
+        ] {
+            sqlx::raw_sql(migration)
+                .execute(&pool)
+                .await
+                .map_err(|error| {
+                    format!("Не удалось применить схему чата в PostgreSQL: {error}")
+                })?;
+        }
 
         info!("connected to PostgreSQL");
         Ok(Self { pool })
@@ -209,13 +219,18 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Сохраняет сообщение общего канала.
-    pub async fn save_public(&self, message: &ChatMessage) -> Result<(), sqlx::Error> {
+    /// Сохраняет сообщение общего канала от имени аккаунта `author_id`.
+    pub async fn save_public(
+        &self,
+        message: &ChatMessage,
+        author_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO chat_messages (id, author, body, sent_at) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO chat_messages (id, author_id, body, sent_at)
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(message.id)
-        .bind(&message.author)
+        .bind(author_id)
         .bind(&message.text)
         .bind(message.sent_at)
         .execute(&self.pool)
@@ -226,9 +241,14 @@ impl ChatDb {
 
     /// Последние `limit` публичных сообщений, самые старые первыми.
     pub async fn load_public_history(&self, limit: i64) -> Result<Vec<ChatMessage>, sqlx::Error> {
-        // Берём хвост истории по убыванию seq, а затем разворачиваем его.
+        // В истории хранится только UUID автора, имя подтягиваем из аккаунта.
+        // Берём хвост по убыванию seq, а затем разворачиваем его.
         let rows = sqlx::query(
-            "SELECT id, author, body, sent_at FROM chat_messages ORDER BY seq DESC LIMIT $1",
+            "SELECT m.id, a.username AS author, m.body, m.sent_at
+             FROM chat_messages m
+             JOIN accounts a ON a.id = m.author_id
+             ORDER BY m.seq DESC
+             LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -246,17 +266,20 @@ impl ChatDb {
             .collect())
     }
 
-    /// Сохраняет личное сообщение вместе с ключами имён без учёта регистра.
-    pub async fn save_direct(&self, message: &DirectMessage) -> Result<(), sqlx::Error> {
+    /// Сохраняет личное сообщение с идентификаторами отправителя и получателя.
+    pub async fn save_direct(
+        &self,
+        message: &DirectMessage,
+        sender_id: Uuid,
+        recipient_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO direct_messages (id, sender, recipient, sender_key, recipient_key, body, sent_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO direct_messages (id, sender_id, recipient_id, body, sent_at)
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(message.id)
-        .bind(&message.from)
-        .bind(&message.to)
-        .bind(name_key(&message.from))
-        .bind(name_key(&message.to))
+        .bind(sender_id)
+        .bind(recipient_id)
         .bind(&message.text)
         .bind(message.sent_at)
         .execute(&self.pool)
@@ -265,50 +288,53 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Личные переписки пользователя: в каждой — последние сообщения,
+    /// Личные переписки аккаунта: в каждой — последние сообщения,
     /// самые старые первыми, а список диалогов отсортирован по свежести.
     pub async fn load_direct_threads(
         &self,
-        name: &str,
+        account_id: Uuid,
         per_thread: i64,
     ) -> Result<Vec<DirectThread>, sqlx::Error> {
-        let key = name_key(name);
-
-        // Для каждого сообщения определяем собеседника (`peer_key`), затем
+        // Для каждого сообщения определяем собеседника (`peer_id`), затем
         // нумеруем сообщения внутри диалога от новых к старым и оставляем
-        // только `per_thread` последних.
+        // только `per_thread` последних. Имена участников берём из accounts.
         let messages = sqlx::query(
             "WITH involved AS (
-                 SELECT seq, id, sender, recipient, body, sent_at,
-                        CASE WHEN sender_key = $1 THEN recipient_key ELSE sender_key END AS peer_key
+                 SELECT seq, id, sender_id, recipient_id, body, sent_at,
+                        CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS peer_id
                  FROM direct_messages
-                 WHERE sender_key = $1 OR recipient_key = $1
+                 WHERE sender_id = $1 OR recipient_id = $1
              ),
              ranked AS (
-                 SELECT *, ROW_NUMBER() OVER (PARTITION BY peer_key ORDER BY seq DESC) AS newest_first
+                 SELECT *, ROW_NUMBER() OVER (PARTITION BY peer_id ORDER BY seq DESC) AS newest_first
                  FROM involved
              )
-             SELECT seq, id, sender, recipient, body, sent_at, peer_key
-             FROM ranked
-             WHERE newest_first <= $2
-             ORDER BY seq",
+             SELECT r.seq, r.id, s.username AS sender, rc.username AS recipient,
+                    r.body, r.sent_at, r.peer_id, p.username AS peer
+             FROM ranked r
+             JOIN accounts s ON s.id = r.sender_id
+             JOIN accounts rc ON rc.id = r.recipient_id
+             JOIN accounts p ON p.id = r.peer_id
+             WHERE r.newest_first <= $2
+             ORDER BY r.seq",
         )
-        .bind(&key)
+        .bind(account_id)
         .bind(per_thread)
         .fetch_all(&self.pool)
         .await?;
 
         // Непрочитанные считаем как сообщения, пришедшие после отметки `direct_reads`.
         let unread_rows = sqlx::query(
-            "SELECT m.sender_key AS peer_key, COUNT(*) AS unread
+            "SELECT m.sender_id AS peer_id, COUNT(*) AS unread
              FROM direct_messages m
-             WHERE m.recipient_key = $1
+             WHERE m.recipient_id = $1
                AND m.seq > COALESCE(
-                   (SELECT r.last_seq FROM direct_reads r WHERE r.user_key = $1 AND r.peer_key = m.sender_key),
+                   (SELECT r.last_seq FROM direct_reads r
+                    WHERE r.user_id = $1 AND r.peer_id = m.sender_id),
                    0)
-             GROUP BY m.sender_key",
+             GROUP BY m.sender_id",
         )
-        .bind(&key)
+        .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -316,32 +342,23 @@ impl ChatDb {
         #[derive(Default)]
         struct Thread {
             peer: String,
-            last_seq: i64,
             messages: Vec<DirectMessage>,
             unread: i64,
         }
 
-        let mut threads: BTreeMap<String, Thread> = BTreeMap::new();
+        let mut threads: BTreeMap<Uuid, Thread> = BTreeMap::new();
 
-        // Складываем сообщения в диалоги по ключу собеседника.
+        // Складываем сообщения в диалоги по идентификатору собеседника.
         for row in messages {
-            let peer_key: String = row.get("peer_key");
-            let sender: String = row.get("sender");
-            let recipient: String = row.get("recipient");
+            let peer_id: Uuid = row.get("peer_id");
+            let peer: String = row.get("peer");
 
-            let entry = threads.entry(peer_key.clone()).or_default();
-            // Предпочитаем написание, которое собеседник использовал при входе.
-            entry.peer = if name_key(&sender) == key {
-                recipient.clone()
-            } else {
-                sender.clone()
-            };
-
-            entry.last_seq = row.get::<i64, _>("seq");
+            let entry = threads.entry(peer_id).or_default();
+            entry.peer = peer;
             entry.messages.push(DirectMessage {
                 id: row.get("id"),
-                from: sender,
-                to: recipient,
+                from: row.get("sender"),
+                to: row.get("recipient"),
                 text: row.get("body"),
                 sent_at: row.get("sent_at"),
             });
@@ -349,14 +366,10 @@ impl ChatDb {
 
         // Добавляем счётчики непрочитанных; диалог мог не попасть в выборку сообщений.
         for row in unread_rows {
-            let peer_key: String = row.get("peer_key");
+            let peer_id: Uuid = row.get("peer_id");
             let unread: i64 = row.get("unread");
 
-            let entry = threads.entry(peer_key.clone()).or_default();
-            if entry.peer.is_empty() {
-                entry.peer = peer_key;
-            }
-            entry.unread = unread;
+            threads.entry(peer_id).or_default().unread = unread;
         }
 
         let mut result: Vec<DirectThread> = threads
@@ -382,35 +395,31 @@ impl ChatDb {
         Ok(result)
     }
 
-    /// Запоминает, что `user` прочитал всё, что `peer` отправил к этому моменту.
-    pub async fn mark_read(&self, user: &str, peer: &str) -> Result<(), sqlx::Error> {
-        let user_key = name_key(user);
-        let peer_key = name_key(peer);
-
+    /// Запоминает, что `account_id` прочитал всё, что `peer` отправил к этому моменту.
+    ///
+    /// Собеседник ищется по ключу имени: клиент знает только имя из списка
+    /// участников, а отметка хранится уже по UUID.
+    pub async fn mark_read(&self, account_id: Uuid, peer_key: &str) -> Result<(), sqlx::Error> {
         // Отметка ставится на максимальный seq в диалоге в обе стороны.
-        let last_seq: i64 = sqlx::query(
-            "SELECT COALESCE(MAX(seq), 0) AS last_seq
-             FROM direct_messages
-             WHERE (sender_key = $1 AND recipient_key = $2)
-                OR (sender_key = $2 AND recipient_key = $1)",
-        )
-        .bind(&user_key)
-        .bind(&peer_key)
-        .fetch_one(&self.pool)
-        .await?
-        .get("last_seq");
-
         // Счётчик прочитанного может только расти.
         sqlx::query(
-            "INSERT INTO direct_reads (user_key, peer_key, last_seq, read_at)
-             VALUES ($1, $2, $3, now())
-             ON CONFLICT (user_key, peer_key)
+            "INSERT INTO direct_reads (user_id, peer_id, last_seq, read_at)
+             SELECT $1, p.id,
+                    COALESCE((
+                        SELECT MAX(m.seq)
+                        FROM direct_messages m
+                        WHERE (m.sender_id = $1 AND m.recipient_id = p.id)
+                           OR (m.recipient_id = $1 AND m.sender_id = p.id)
+                    ), 0),
+                    now()
+             FROM accounts p
+             WHERE p.username_key = $2
+             ON CONFLICT (user_id, peer_id)
              DO UPDATE SET last_seq = GREATEST(direct_reads.last_seq, EXCLUDED.last_seq),
                            read_at = now()",
         )
-        .bind(&user_key)
-        .bind(&peer_key)
-        .bind(last_seq)
+        .bind(account_id)
+        .bind(peer_key)
         .execute(&self.pool)
         .await?;
 
@@ -429,12 +438,16 @@ impl ChatDb {
         Ok((row.get("public"), row.get("direct")))
     }
 
-    /// Удаляет все сохранённые сообщения. Используется интеграционным тестом PostgreSQL.
+    /// Удаляет все сохранённые сообщения и аккаунты. Используется интеграционным
+    /// тестом PostgreSQL.
     #[cfg(test)]
     async fn truncate(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("TRUNCATE chat_messages, direct_messages, direct_reads RESTART IDENTITY")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "TRUNCATE chat_messages, direct_messages, direct_reads, sessions, accounts
+             RESTART IDENTITY",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -466,6 +479,10 @@ mod tests {
         }
     }
 
+    fn name(value: &str) -> UserName {
+        UserName::parse(value).expect("valid test name")
+    }
+
     // Требует запущенного PostgreSQL, например:
     //   $env:CHAT_DB_URL = "postgres://<user>:<password>@localhost:5432/rust_chat"
     //   cargo test -- --ignored
@@ -476,34 +493,48 @@ mod tests {
         let db = ChatDb::connect(&url).await.expect("connect to PostgreSQL");
         db.truncate().await.expect("truncate");
 
-        db.save_public(&public("первое")).await.unwrap();
-        db.save_public(&public("второе")).await.unwrap();
+        // Сообщения ссылаются на аккаунты, поэтому сначала создаём участников.
+        let alice = db
+            .create_account(&name("Алиса"), "hash")
+            .await
+            .unwrap()
+            .expect("create Алиса");
+        let bob = db
+            .create_account(&name("Боб"), "hash")
+            .await
+            .unwrap()
+            .expect("create Боб");
+
+        db.save_public(&public("первое"), alice.id).await.unwrap();
+        db.save_public(&public("второе"), alice.id).await.unwrap();
 
         // Лимит соблюдается, а последнее сообщение считается самым новым.
         let history = db.load_public_history(1).await.unwrap();
         assert_eq!(history.len(), 1, "limit is respected");
         assert_eq!(history[0].text, "второе", "newest message wins");
+        assert_eq!(history[0].author, "Алиса", "author is joined from accounts");
 
-        db.save_direct(&direct("Алиса", "Боб", "привет"))
+        db.save_direct(&direct("Алиса", "Боб", "привет"), alice.id, bob.id)
             .await
             .unwrap();
-        db.save_direct(&direct("БОБ", "алиса", "здарова"))
+        db.save_direct(&direct("Боб", "Алиса", "здарова"), bob.id, alice.id)
             .await
             .unwrap();
 
-        // Один диалог независимо от регистра имён, ответ Боба не прочитан.
+        // Один диалог независимо от написания имён, ответ Боба не прочитан.
         let threads = db
-            .load_direct_threads("алиса", THREAD_REPLAY)
+            .load_direct_threads(alice.id, THREAD_REPLAY)
             .await
             .unwrap();
-        assert_eq!(threads.len(), 1, "one conversation, any spelling");
+        assert_eq!(threads.len(), 1, "one conversation for the account pair");
         assert_eq!(threads[0].messages.len(), 2);
+        assert_eq!(threads[0].peer, "Боб");
         assert_eq!(threads[0].unread, 1, "the reply from Боб is unread");
 
         // Отметка о прочтении обнуляет счётчик.
-        db.mark_read("Алиса", "боб").await.unwrap();
+        db.mark_read(alice.id, &name_key("боб")).await.unwrap();
         let after = db
-            .load_direct_threads("Алиса", THREAD_REPLAY)
+            .load_direct_threads(alice.id, THREAD_REPLAY)
             .await
             .unwrap();
         assert_eq!(after[0].unread, 0, "read mark clears the counter");

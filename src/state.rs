@@ -51,6 +51,9 @@ struct Inner {
 }
 
 struct User {
+    /// Аккаунт, которому принадлежит окно. Именно он, а не имя, связывает
+    /// соединение с сохранёнными сообщениями.
+    account_id: Uuid,
     name: String,
     /// Хеш токена сессии, по которому открыто это окно.
     ///
@@ -60,6 +63,17 @@ struct User {
     /// Личные сообщения кладутся сюда, а не в общий broadcast-канал,
     /// чтобы их содержимое не уходило другим соединениям.
     inbox: mpsc::Sender<ServerMessage>,
+}
+
+/// Одно открытое окно пользователя.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+    /// Идентификатор WebSocket-соединения.
+    pub id: Uuid,
+    /// Имя аккаунта в написании при регистрации.
+    pub name: String,
+    /// Идентификатор аккаунта: по нему сохраняются сообщения.
+    pub account_id: Uuid,
 }
 
 impl ChatState {
@@ -251,8 +265,7 @@ impl ChatState {
 
         // И сразу закрываем их открытые WebSocket-соединения: недостаточно
         // просто удалить токен, если украденное соединение уже установлено.
-        self.end_other_sessions(&account.username, &token_hash)
-            .await;
+        self.end_other_sessions(account.id, &token_hash).await;
 
         Ok(())
     }
@@ -276,19 +289,21 @@ impl ChatState {
     pub async fn join(
         &self,
         id: Uuid,
-        name: &UserName,
+        account: &Account,
         token_hash: &str,
         inbox: mpsc::Sender<ServerMessage>,
     ) -> (Vec<String>, bool) {
         let mut users = self.inner.users.write().await;
 
-        let key = name_key(name.as_str());
-        let first = !users.values().any(|user| name_key(&user.name) == key);
+        // Первым считается окно, которое открыло аккаунт впервые: только оно
+        // объявляет вход остальным.
+        let first = !users.values().any(|user| user.account_id == account.id);
 
         users.insert(
             id,
             User {
-                name: name.as_str().to_owned(),
+                account_id: account.id,
+                name: account.username.clone(),
                 token_hash: token_hash.to_owned(),
                 inbox,
             },
@@ -305,8 +320,9 @@ impl ChatState {
         let mut users = self.inner.users.write().await;
         let user = users.remove(&id)?;
 
-        let key = name_key(&user.name);
-        let still_online = users.values().any(|other| name_key(&other.name) == key);
+        let still_online = users
+            .values()
+            .any(|other| other.account_id == user.account_id);
 
         Some((user.name, still_online))
     }
@@ -322,24 +338,26 @@ impl ChatState {
     /// Все соединения пользователя с указанным именем (без учёта регистра).
     ///
     /// Личное сообщение доставляется в каждое открытое окно получателя.
-    pub async fn connections(&self, name: &str) -> Vec<(Uuid, String)> {
+    pub async fn connections(&self, name: &str) -> Vec<Connection> {
         let key = name_key(name);
         let users = self.inner.users.read().await;
 
         users
             .iter()
             .filter(|(_, user)| name_key(&user.name) == key)
-            .map(|(id, user)| (*id, user.name.clone()))
+            .map(|(id, user)| Connection {
+                id: *id,
+                name: user.name.clone(),
+                account_id: user.account_id,
+            })
             .collect()
     }
 
-    /// Завершает все соединения пользователя, открытые с других токенов.
+    /// Завершает все соединения аккаунта, открытые с других токенов.
     ///
     /// Вызывается после смены пароля: окна с тем же токеном остаются в чате,
     /// а чужие устройства получают `session_ended` и закрывают соединение.
-    pub async fn end_other_sessions(&self, name: &str, keep_token_hash: &str) {
-        let key = name_key(name);
-
+    pub async fn end_other_sessions(&self, account_id: Uuid, keep_token_hash: &str) {
         // Собираем отправители под блокировкой, а отправляем уже без неё.
         let targets: Vec<mpsc::Sender<ServerMessage>> = self
             .inner
@@ -347,7 +365,7 @@ impl ChatState {
             .read()
             .await
             .values()
-            .filter(|user| name_key(&user.name) == key && user.token_hash != keep_token_hash)
+            .filter(|user| user.account_id == account_id && user.token_hash != keep_token_hash)
             .map(|user| user.inbox.clone())
             .collect();
 
@@ -386,9 +404,12 @@ impl ChatState {
 
     /// Сохраняет сообщение в ограниченной истории, пишет его в базу и рассылает.
     ///
+    /// `author_id` — аккаунт автора: в PostgreSQL сообщение ссылается на него,
+    /// а не на имя.
+    ///
     /// Блокировка истории удерживается и во время рассылки, чтобы порядок в
     /// истории совпадал с порядком доставки, даже если пишут несколько клиентов сразу.
-    pub async fn publish(&self, message: ChatMessage) {
+    pub async fn publish(&self, message: ChatMessage, author_id: Uuid) {
         {
             let mut history = self.inner.history.write().await;
 
@@ -406,7 +427,7 @@ impl ChatState {
         // В базу пишем вне блокировки: порядок после перезапуска задаёт `seq`,
         // а в текущей сессии порядок уже определён выше.
         if let Some(db) = &self.inner.db
-            && let Err(error) = db.save_public(&message).await
+            && let Err(error) = db.save_public(&message, author_id).await
         {
             warn!(%error, "failed to store a public message");
         }
@@ -414,23 +435,23 @@ impl ChatState {
 
     /// Сохраняет личное сообщение до его доставки, чтобы клиент никогда не получил
     /// то, чего ещё нет в базе.
-    pub async fn save_direct(&self, message: &DirectMessage) {
+    pub async fn save_direct(&self, message: &DirectMessage, sender_id: Uuid, recipient_id: Uuid) {
         if let Some(db) = &self.inner.db
-            && let Err(error) = db.save_direct(message).await
+            && let Err(error) = db.save_direct(message, sender_id, recipient_id).await
         {
             warn!(%error, "failed to store a private message");
         }
     }
 
-    /// Личные переписки пользователя из базы.
+    /// Личные переписки аккаунта из базы.
     ///
     /// Если собеседник сейчас онлайн, имя приводится к написанию, под которым он вошёл.
-    pub async fn direct_threads(&self, name: &str) -> Vec<DirectThread> {
+    pub async fn direct_threads(&self, account_id: Uuid) -> Vec<DirectThread> {
         let Some(db) = &self.inner.db else {
             return Vec::new();
         };
 
-        let threads = match db.load_direct_threads(name, THREAD_REPLAY).await {
+        let threads = match db.load_direct_threads(account_id, THREAD_REPLAY).await {
             Ok(threads) => threads,
             Err(error) => {
                 warn!(%error, "failed to load private threads");
@@ -455,10 +476,12 @@ impl ChatState {
             .collect()
     }
 
-    /// Запоминает, что пользователь прочитал всё, что прислал собеседник.
-    pub async fn mark_read(&self, user: &str, peer: &str) {
+    /// Запоминает, что аккаунт прочитал всё, что прислал собеседник.
+    pub async fn mark_read(&self, account_id: Uuid, peer: &str) {
+        let peer_key = name_key(peer);
+
         if let Some(db) = &self.inner.db
-            && let Err(error) = db.mark_read(user, peer).await
+            && let Err(error) = db.mark_read(account_id, &peer_key).await
         {
             warn!(%error, "failed to store a read mark");
         }
@@ -497,8 +520,11 @@ mod tests {
     use crate::protocol::DirectMessage;
     use chrono::Utc;
 
-    fn text(value: &str) -> UserName {
-        UserName::parse(value).expect("valid test name")
+    fn account(name: &str) -> Account {
+        Account {
+            id: Uuid::new_v4(),
+            username: name.to_owned(),
+        }
     }
 
     fn inbox() -> mpsc::Sender<ServerMessage> {
@@ -527,15 +553,16 @@ mod tests {
     #[tokio::test]
     async fn allows_multiple_windows_for_one_account() {
         let state = ChatState::new();
+        let anna = account("Анна");
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
-        let (users, is_first) = state.join(first, &text("Анна"), "token-a", inbox()).await;
+        let (users, is_first) = state.join(first, &anna, "token-a", inbox()).await;
         assert!(is_first);
         assert_eq!(users, ["Анна"]);
 
         // Второе окно того же аккаунта не создаёт вторую строку в списке.
-        let (users, is_first) = state.join(second, &text("Анна"), "token-a", inbox()).await;
+        let (users, is_first) = state.join(second, &anna, "token-a", inbox()).await;
         assert!(!is_first);
         assert_eq!(users, ["Анна"]);
 
@@ -547,18 +574,19 @@ mod tests {
     #[tokio::test]
     async fn ends_only_sessions_with_another_token() {
         let state = ChatState::new();
+        let anna = account("Анна");
 
         let (own_inbox, mut own_messages) = mpsc::channel(PERSONAL_QUEUE);
         state
-            .join(Uuid::new_v4(), &text("Анна"), "token-a", own_inbox)
+            .join(Uuid::new_v4(), &anna, "token-a", own_inbox)
             .await;
 
         let (other_inbox, mut other_messages) = mpsc::channel(PERSONAL_QUEUE);
         state
-            .join(Uuid::new_v4(), &text("Анна"), "token-b", other_inbox)
+            .join(Uuid::new_v4(), &anna, "token-b", other_inbox)
             .await;
 
-        state.end_other_sessions("анна", "token-a").await;
+        state.end_other_sessions(anna.id, "token-a").await;
 
         // Чужое устройство получило команду закрыть соединение.
         assert!(matches!(
@@ -572,11 +600,13 @@ mod tests {
     #[tokio::test]
     async fn keeps_users_sorted_and_removes_them_on_leave() {
         let state = ChatState::new();
+        let apple = account("яблоко");
+        let banana = account("Банан");
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
-        state.join(first, &text("яблоко"), "token-a", inbox()).await;
-        state.join(second, &text("Банан"), "token-b", inbox()).await;
+        state.join(first, &apple, "token-a", inbox()).await;
+        state.join(second, &banana, "token-b", inbox()).await;
         assert_eq!(state.users().await, ["Банан", "яблоко"]);
 
         assert_eq!(state.leave(first).await, Some(("яблоко".to_owned(), false)));
@@ -587,20 +617,22 @@ mod tests {
     #[tokio::test]
     async fn delivers_direct_messages_only_to_the_recipient() {
         let state = ChatState::new();
-        let alice = Uuid::new_v4();
-        let bob = Uuid::new_v4();
+        let alice = account("Алиса");
+        let bob = account("Боб");
 
-        state.join(alice, &text("Алиса"), "token-a", inbox()).await;
+        state.join(Uuid::new_v4(), &alice, "token-a", inbox()).await;
         let (bob_inbox, mut bob_messages) = mpsc::channel(PERSONAL_QUEUE);
-        state.join(bob, &text("Боб"), "token-b", bob_inbox).await;
+        state.join(Uuid::new_v4(), &bob, "token-b", bob_inbox).await;
 
         let connections = state.connections("боб").await;
-        assert_eq!(connections, [(bob, "Боб".to_owned())]);
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].name, "Боб");
+        assert_eq!(connections[0].account_id, bob.id);
 
         let message = direct("Алиса", "Боб", "привет");
         assert!(
             state
-                .send_to(connections[0].0, ServerMessage::Direct { message })
+                .send_to(connections[0].id, ServerMessage::Direct { message })
                 .await
         );
 
@@ -636,7 +668,9 @@ mod tests {
 
         // Публикуем больше сообщений, чем помещается в историю.
         for index in 0..(HISTORY_LIMIT + 5) {
-            state.publish(message("bot", &index.to_string())).await;
+            state
+                .publish(message("bot", &index.to_string()), Uuid::new_v4())
+                .await;
         }
 
         let history = state.history().await;

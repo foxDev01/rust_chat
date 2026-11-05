@@ -28,9 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{self, Account},
-    protocol::{
-        ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName, name_key,
-    },
+    protocol::{ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName},
     state::{ChatState, PERSONAL_QUEUE},
 };
 
@@ -198,10 +196,10 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
 
     // Один аккаунт может быть открыт в нескольких окнах: каждое соединение
     // живёт отдельно, а имя в списке участников показывается один раз.
-    let (users, first_window) = state.join(id, &name, &token_hash, inbox).await;
+    let (users, first_window) = state.join(id, &account, &token_hash, inbox).await;
 
     // Приветствие, публичная история и личные переписки.
-    if !send_initial(&mut sink, &state, &name, users).await {
+    if !send_initial(&mut sink, &state, &account, &name, users).await {
         state.leave(id).await;
         let _ = sink.close().await;
         return;
@@ -232,7 +230,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
 
                 match message {
                     Message::Text(text) => {
-                        if !handle_text(text.as_str(), id, &name, &state, &mut sink).await {
+                        if !handle_text(text.as_str(), id, &account, &name, &state, &mut sink).await {
                             break;
                         }
                     }
@@ -317,6 +315,7 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
 async fn send_initial(
     sink: &mut SocketSink,
     state: &ChatState,
+    account: &Account,
     name: &UserName,
     users: Vec<String>,
 ) -> bool {
@@ -337,7 +336,7 @@ async fn send_initial(
 
     // Личные переписки не входят в публичную историю: клиенту нужны
     // они отдельно по собеседникам, со счётчиками непрочитанных.
-    let threads = state.direct_threads(name.as_str()).await;
+    let threads = state.direct_threads(account.id).await;
     if !threads.is_empty()
         && send_json(sink, &ServerMessage::DirectHistory { threads })
             .await
@@ -355,6 +354,7 @@ async fn send_initial(
 async fn handle_text(
     raw: &str,
     id: Uuid,
+    account: &Account,
     author: &UserName,
     state: &ChatState,
     sink: &mut SocketSink,
@@ -383,7 +383,7 @@ async fn handle_text(
             };
 
             // Публикация сама сохранит сообщение и разошлёт его всем.
-            state.publish(message).await;
+            state.publish(message, account.id).await;
             true
         }
         ClientMessage::Direct { to, text } => {
@@ -400,36 +400,40 @@ async fn handle_text(
             // Личные сообщения доставляются только тем, кто сейчас онлайн.
             // У получателя может быть открыто несколько окон — шлём в каждое.
             let connections = state.connections(recipient.as_str()).await;
-            let Some((_, recipient_name)) = connections.first() else {
+            let Some(recipient_connection) = connections.first() else {
                 return send_error(sink, "Пользователь не в сети").await;
             };
 
-            // Имена уникальны без учёта регистра, поэтому это и есть «себе».
-            if name_key(recipient.as_str()) == name_key(author.as_str()) {
+            // Идентификатор аккаунта точно отвечает на вопрос «это я сам?»,
+            // даже если сравнивать пришлось бы имена в разном регистре.
+            if recipient_connection.account_id == account.id {
                 return send_error(sink, "Нельзя отправить личное сообщение самому себе").await;
             }
 
             let message = DirectMessage {
                 id: Uuid::new_v4(),
                 from: author.to_string(),
-                to: recipient_name.clone(),
+                to: recipient_connection.name.clone(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
             };
 
             // Сначала сохраняем: восстановленный диалог не должен потерять
-            // сообщение, которое клиент уже получил.
-            state.save_direct(&message).await;
+            // сообщение, которое клиент уже получил. В базе участники диалога
+            // хранятся как account_id.
+            state
+                .save_direct(&message, account.id, recipient_connection.account_id)
+                .await;
 
             let mut delivered = 0;
-            for (connection_id, _) in &connections {
-                if *connection_id == id {
+            for connection in &connections {
+                if connection.id == id {
                     continue;
                 }
 
                 if state
                     .send_to(
-                        *connection_id,
+                        connection.id,
                         ServerMessage::Direct {
                             message: message.clone(),
                         },
@@ -446,14 +450,14 @@ async fn handle_text(
 
             // Копию отправителю шлём в его текущий сокет, а остальным окнам
             // того же аккаунта — через их личные очереди.
-            for (connection_id, _) in state.connections(author.as_str()).await {
-                if connection_id == id {
+            for connection in state.connections(author.as_str()).await {
+                if connection.id == id {
                     continue;
                 }
 
                 state
                     .send_to(
-                        connection_id,
+                        connection.id,
                         ServerMessage::Direct {
                             message: message.clone(),
                         },
@@ -471,7 +475,7 @@ async fn handle_text(
                 Err(reason) => return send_error(sink, reason).await,
             };
 
-            state.mark_read(author.as_str(), peer.as_str()).await;
+            state.mark_read(account.id, peer.as_str()).await;
             true
         }
     }
