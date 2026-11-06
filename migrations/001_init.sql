@@ -26,14 +26,26 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_account_id_idx
     ON sessions (account_id);
 
--- Публичная история общего канала.
+-- Комнаты общего чата. Стартовый набор и названия синхронизирует сервер
+-- (DEFAULT_ROOMS в src/protocol.rs), position задаёт порядок в интерфейсе.
+CREATE TABLE IF NOT EXISTS rooms (
+    id       TEXT PRIMARY KEY,
+    title    TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0
+);
+
+-- Публичная история по комнатам.
 CREATE TABLE IF NOT EXISTS chat_messages (
     seq       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     id        UUID NOT NULL UNIQUE,
+    room_id   TEXT NOT NULL DEFAULT 'general' REFERENCES rooms(id) ON DELETE CASCADE,
     author_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     body      TEXT NOT NULL,
     sent_at   TIMESTAMPTZ NOT NULL
 );
+
+-- Индекс по (room_id, seq) создаёт миграция 003: на старых базах колонки
+-- room_id ещё нет, когда применяется этот файл.
 
 -- Личные сообщения. Пара sender_id/recipient_id однозначно задаёт диалог,
 -- даже если один из участников сменит имя.

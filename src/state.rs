@@ -4,7 +4,7 @@
 //! же экземпляр используют все WebSocket-соединения и HTTP-обработчики.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::IpAddr,
     sync::Arc,
     time::Duration,
@@ -17,12 +17,16 @@ use uuid::Uuid;
 use crate::auth::{self, Account, AuthError, AuthSession};
 use crate::db::{ChatDb, THREAD_REPLAY};
 use crate::protocol::{
-    ChatMessage, DirectMessage, DirectThread, ServerMessage, UserName, name_key,
+    ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, ServerMessage, UserName,
+    name_key,
 };
 use crate::rate_limit::{LOGIN_QUOTA, REGISTER_QUOTA, RateLimiter};
 
-/// Сколько последних сообщений получает новый клиент при подключении.
+/// Сколько последних сообщений комнаты получает новый клиент при подключении.
 pub const HISTORY_LIMIT: usize = 100;
+
+/// Сколько сообщений отдаётся за один запрос более старой истории.
+pub const PAGE_LIMIT: i64 = 50;
 
 /// Сколько событий может накопиться у медленного клиента, прежде чем они начнут пропускаться.
 const BROADCAST_CAPACITY: usize = 256;
@@ -41,8 +45,10 @@ struct Inner {
     events: broadcast::Sender<ServerMessage>,
     /// Подключённые пользователи: id соединения → имя и личная очередь.
     users: RwLock<BTreeMap<Uuid, User>>,
-    /// Ограниченная история общего канала (не более [`HISTORY_LIMIT`] сообщений).
-    history: RwLock<VecDeque<ChatMessage>>,
+    /// Доступные комнаты в порядке отображения.
+    rooms: RwLock<Vec<Room>>,
+    /// Ограниченная история каждой комнаты (не более [`HISTORY_LIMIT`] сообщений).
+    history: RwLock<HashMap<String, VecDeque<ChatMessage>>>,
     /// Лимиты попыток входа и регистрации по IP-адресу.
     login_limiter: RateLimiter,
     register_limiter: RateLimiter,
@@ -89,12 +95,21 @@ impl ChatState {
             warn!(%error, "failed to purge expired sessions");
         }
 
-        let stored = db.load_public_history(HISTORY_LIMIT as i64).await?;
+        // Комнаты уже созданы при подключении к базе (`ensure_rooms`).
+        let rooms = db.load_rooms().await?;
+        let mut stored = HashMap::with_capacity(rooms.len());
+
+        for room in &rooms {
+            let (messages, _) = db
+                .load_public_history(&room.id, HISTORY_LIMIT as i64)
+                .await?;
+            stored.insert(room.id.clone(), VecDeque::from(messages));
+        }
+
         let state = Self::with_db(Some(db));
 
-        let mut history = state.inner.history.write().await;
-        *history = VecDeque::from(stored);
-        drop(history);
+        *state.inner.rooms.write().await = rooms;
+        *state.inner.history.write().await = stored;
 
         Ok(state)
     }
@@ -103,11 +118,26 @@ impl ChatState {
     fn with_db(db: Option<ChatDb>) -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
 
+        // Без базы комнаты берутся из кода: тесты работают с тем же набором,
+        // что и настоящий сервер.
+        let rooms: Vec<Room> = DEFAULT_ROOMS
+            .iter()
+            .map(|(id, title)| Room {
+                id: (*id).to_owned(),
+                title: (*title).to_owned(),
+            })
+            .collect();
+        let history = rooms
+            .iter()
+            .map(|room| (room.id.clone(), VecDeque::with_capacity(HISTORY_LIMIT)))
+            .collect();
+
         Self {
             inner: Arc::new(Inner {
                 events,
                 users: RwLock::new(BTreeMap::new()),
-                history: RwLock::new(VecDeque::with_capacity(HISTORY_LIMIT)),
+                rooms: RwLock::new(rooms),
+                history: RwLock::new(history),
                 login_limiter: RateLimiter::new(LOGIN_QUOTA),
                 register_limiter: RateLimiter::new(REGISTER_QUOTA),
                 db,
@@ -397,12 +427,89 @@ impl ChatState {
         inbox.try_send(message).is_ok()
     }
 
-    /// Снимок текущей публичной истории.
-    pub async fn history(&self) -> Vec<ChatMessage> {
-        self.inner.history.read().await.iter().cloned().collect()
+    /// Комнаты в порядке отображения.
+    pub async fn rooms(&self) -> Vec<Room> {
+        self.inner.rooms.read().await.clone()
     }
 
-    /// Сохраняет сообщение в ограниченной истории, пишет его в базу и рассылает.
+    /// Комната, в которой соединение начинает работу.
+    pub async fn initial_room(&self) -> String {
+        self.inner
+            .rooms
+            .read()
+            .await
+            .first()
+            .map(|room| room.id.clone())
+            .unwrap_or_else(|| "general".to_owned())
+    }
+
+    /// Существует ли такая комната.
+    pub async fn is_room(&self, room: &str) -> bool {
+        self.inner
+            .rooms
+            .read()
+            .await
+            .iter()
+            .any(|candidate| candidate.id == room)
+    }
+
+    /// Снимок последних сообщений комнаты из памяти.
+    pub async fn history_snapshot(&self, room: &str) -> Vec<ChatMessage> {
+        self.inner
+            .history
+            .read()
+            .await
+            .get(room)
+            .map(|messages| messages.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Последние сообщения комнаты и признак наличия более старых.
+    pub async fn initial_history(&self, room: &str) -> (Vec<ChatMessage>, bool) {
+        if let Some(db) = &self.inner.db {
+            match db.load_public_history(room, HISTORY_LIMIT as i64).await {
+                Ok(page) => return page,
+                Err(error) => {
+                    warn!(%error, %room, "failed to load room history from PostgreSQL");
+                }
+            }
+        }
+
+        // Без базы или при её ошибке отдаём то, что уже есть в памяти.
+        // Признак `has_more` в этом случае неизвестен, поэтому `false`.
+        (self.history_snapshot(room).await, false)
+    }
+
+    /// Порция истории комнаты, которая старше сообщения `before`.
+    ///
+    /// Если сообщение не найдено, возвращается пустая страница: клиент
+    /// перестанет показывать кнопку подгрузки.
+    pub async fn history_page(&self, room: &str, before: Uuid) -> (Vec<ChatMessage>, bool) {
+        if let Some(db) = &self.inner.db {
+            match db.load_public_page(room, Some(before), PAGE_LIMIT).await {
+                Ok(page) => return page,
+                Err(error) => {
+                    warn!(%error, %room, "failed to load a history page from PostgreSQL");
+                }
+            }
+        }
+
+        // Запасной путь для состояния в памяти: ищем сообщение в очереди
+        // и берём до PAGE_LIMIT элементов перед ним.
+        let history = self.inner.history.read().await;
+        let Some(messages) = history.get(room) else {
+            return (Vec::new(), false);
+        };
+        let Some(index) = messages.iter().position(|message| message.id == before) else {
+            return (Vec::new(), false);
+        };
+
+        let start = index.saturating_sub(PAGE_LIMIT as usize);
+        let page = messages.range(start..index).cloned().collect();
+        (page, start > 0)
+    }
+
+    /// Сохраняет сообщение в истории комнаты, пишет его в базу и рассылает.
     ///
     /// `author_id` — аккаунт автора: в PostgreSQL сообщение ссылается на него,
     /// а не на имя.
@@ -412,12 +519,15 @@ impl ChatState {
     pub async fn publish(&self, message: ChatMessage, author_id: Uuid) {
         {
             let mut history = self.inner.history.write().await;
+            let room = history
+                .entry(message.room.clone())
+                .or_insert_with(|| VecDeque::with_capacity(HISTORY_LIMIT));
 
             // История ограничена: самое старое сообщение вытесняется.
-            if history.len() == HISTORY_LIMIT {
-                history.pop_front();
+            if room.len() == HISTORY_LIMIT {
+                room.pop_front();
             }
-            history.push_back(message.clone());
+            room.push_back(message.clone());
 
             self.broadcast(ServerMessage::Message {
                 message: message.clone(),
@@ -534,6 +644,7 @@ mod tests {
     fn message(author: &str, value: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            room: "general".to_owned(),
             author: author.to_owned(),
             text: value.to_owned(),
             sent_at: Utc::now(),
@@ -663,6 +774,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn starts_with_default_rooms() {
+        let state = ChatState::new();
+        let rooms = state.rooms().await;
+
+        assert_eq!(
+            rooms
+                .iter()
+                .map(|room| room.id.as_str())
+                .collect::<Vec<_>>(),
+            ["general", "rust", "random"]
+        );
+        assert_eq!(state.initial_room().await, "general");
+        assert!(state.is_room("rust").await);
+        assert!(!state.is_room("unknown").await);
+    }
+
+    #[tokio::test]
     async fn history_is_bounded() {
         let state = ChatState::new();
 
@@ -673,12 +801,64 @@ mod tests {
                 .await;
         }
 
-        let history = state.history().await;
+        let history = state.history_snapshot("general").await;
         assert_eq!(history.len(), HISTORY_LIMIT);
         assert_eq!(history.first().unwrap().text, "5");
         assert_eq!(
             history.last().unwrap().text,
             (HISTORY_LIMIT + 4).to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn keeps_rooms_separate() {
+        let state = ChatState::new();
+
+        state
+            .publish(message("bot", "в общей"), Uuid::new_v4())
+            .await;
+
+        let mut rust = message("bot", "в Rust");
+        rust.room = "rust".to_owned();
+        state.publish(rust, Uuid::new_v4()).await;
+
+        assert_eq!(state.history_snapshot("general").await[0].text, "в общей");
+        assert_eq!(state.history_snapshot("rust").await[0].text, "в Rust");
+        assert!(state.history_snapshot("random").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pages_memory_history_from_the_oldest_message() {
+        let state = ChatState::new();
+
+        for index in 0..60 {
+            state
+                .publish(message("bot", &index.to_string()), Uuid::new_v4())
+                .await;
+        }
+
+        let snapshot = state.history_snapshot("general").await;
+        let newest = snapshot.last().unwrap();
+
+        // Перед последним сообщением лежит 59 штук: в страницу входят 50
+        // ближайших, а более старые ещё остаются.
+        let (page, has_more) = state.history_page("general", newest.id).await;
+        assert_eq!(page.len(), PAGE_LIMIT as usize);
+        assert!(has_more);
+        assert_eq!(page.first().unwrap().text, "9");
+        assert_eq!(page.last().unwrap().text, "58");
+
+        // Следующая страница забирает остаток.
+        let (older, has_more) = state
+            .history_page("general", page.first().unwrap().id)
+            .await;
+        assert_eq!(older.len(), 9);
+        assert!(!has_more);
+        assert_eq!(older.first().unwrap().text, "0");
+
+        // Неизвестное сообщение не открывает бесконечную подгрузку.
+        let (empty, has_more) = state.history_page("general", Uuid::new_v4()).await;
+        assert!(empty.is_empty());
+        assert!(!has_more);
     }
 }

@@ -9,9 +9,14 @@ const {
   status,
   me,
   users,
+  rooms,
+  activeRoom,
   conversations,
   activePeer,
   activeTimeline,
+  typingUsers,
+  canLoadOlder,
+  loadingHistory,
   error,
   joined,
   passwordBusy,
@@ -22,6 +27,9 @@ const {
   leave,
   post,
   openConversation,
+  openRoom,
+  loadOlderHistory,
+  notifyTyping,
   changePassword,
   clearPasswordStatus,
   dismissError,
@@ -44,9 +52,14 @@ const {
         key="chat"
         :me="me"
         :users="users"
+        :rooms="rooms"
+        :active-room="activeRoom"
         :timeline="activeTimeline"
         :conversations="conversations"
         :active-peer="activePeer"
+        :typing-users="typingUsers"
+        :can-load-older="canLoadOlder"
+        :loading-history="loadingHistory"
         :status="status"
         :error="error"
         :password-busy="passwordBusy"
@@ -54,6 +67,9 @@ const {
         :password-notice="passwordNotice"
         @send="post"
         @open-conversation="openConversation"
+        @open-room="openRoom"
+        @load-older="loadOlderHistory"
+        @typing="notifyTyping"
         @leave="leave"
         @reconnect="reconnect"
         @change-password="changePassword"

@@ -16,7 +16,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::auth::Account;
-use crate::protocol::{ChatMessage, DirectMessage, DirectThread, UserName, name_key};
+use crate::protocol::{
+    ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, UserName, name_key,
+};
 
 /// Тайм-аут установки соединения с базой.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,6 +60,7 @@ impl ChatDb {
         for migration in [
             include_str!("../migrations/001_init.sql"),
             include_str!("../migrations/002_account_ids.sql"),
+            include_str!("../migrations/003_rooms_pagination.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&pool)
@@ -67,13 +70,59 @@ impl ChatDb {
                 })?;
         }
 
+        let db = Self { pool };
+        // Названия и порядок комнат задаёт код, а не миграция: так список
+        // комнат остаётся в одном месте (DEFAULT_ROOMS в protocol.rs).
+        db.ensure_rooms()
+            .await
+            .map_err(|error| format!("Не удалось подготовить комнаты: {error}"))?;
+
         info!("connected to PostgreSQL");
-        Ok(Self { pool })
+        Ok(db)
     }
 
     /// Закрывает все соединения пула.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Создаёт стартовые комнаты и обновляет их названия и порядок.
+    ///
+    /// `DEFAULT_ROOMS` — единственный источник истины: если название комнаты
+    /// поменяли в коде, при следующем запуске оно обновится и в базе.
+    /// Возвращает актуальный список комнат.
+    pub async fn ensure_rooms(&self) -> Result<Vec<Room>, sqlx::Error> {
+        for (position, (id, title)) in DEFAULT_ROOMS.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO rooms (id, title, position)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (id) DO UPDATE
+                 SET title = EXCLUDED.title,
+                     position = EXCLUDED.position",
+            )
+            .bind(*id)
+            .bind(*title)
+            .bind(position as i32)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.load_rooms().await
+    }
+
+    /// Комнаты в порядке отображения.
+    pub async fn load_rooms(&self) -> Result<Vec<Room>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id, title FROM rooms ORDER BY position, id")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Room {
+                id: row.get("id"),
+                title: row.get("title"),
+            })
+            .collect())
     }
 
     /// Создаёт аккаунт.
@@ -219,17 +268,18 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Сохраняет сообщение общего канала от имени аккаунта `author_id`.
+    /// Сохраняет сообщение комнаты от имени аккаунта `author_id`.
     pub async fn save_public(
         &self,
         message: &ChatMessage,
         author_id: Uuid,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO chat_messages (id, author_id, body, sent_at)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO chat_messages (id, room_id, author_id, body, sent_at)
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(message.id)
+        .bind(&message.room)
         .bind(author_id)
         .bind(&message.text)
         .bind(message.sent_at)
@@ -239,31 +289,63 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Последние `limit` публичных сообщений, самые старые первыми.
-    pub async fn load_public_history(&self, limit: i64) -> Result<Vec<ChatMessage>, sqlx::Error> {
+    /// Последние `limit` сообщений комнаты, самые старые первыми.
+    ///
+    /// Второй элемент — есть ли в базе сообщения старше присланных.
+    pub async fn load_public_history(
+        &self,
+        room: &str,
+        limit: i64,
+    ) -> Result<(Vec<ChatMessage>, bool), sqlx::Error> {
+        self.load_public_page(room, None, limit).await
+    }
+
+    /// Порция сообщений комнаты, которые старше сообщения `before`.
+    ///
+    /// `None` в качестве `before` означает «самые новые сообщения».
+    /// Второй элемент — есть ли ещё более старые сообщения.
+    pub async fn load_public_page(
+        &self,
+        room: &str,
+        before: Option<Uuid>,
+        limit: i64,
+    ) -> Result<(Vec<ChatMessage>, bool), sqlx::Error> {
         // В истории хранится только UUID автора, имя подтягиваем из аккаунта.
-        // Берём хвост по убыванию seq, а затем разворачиваем его.
+        // Запрашиваем на одно сообщение больше, чтобы узнать, есть ли ещё.
         let rows = sqlx::query(
-            "SELECT m.id, a.username AS author, m.body, m.sent_at
+            "SELECT m.id, m.room_id, a.username AS author, m.body, m.sent_at
              FROM chat_messages m
              JOIN accounts a ON a.id = m.author_id
+             WHERE m.room_id = $1
+               AND ($2::uuid IS NULL OR m.seq < (
+                   SELECT anchor.seq
+                   FROM chat_messages anchor
+                   WHERE anchor.id = $2 AND anchor.room_id = $1
+               ))
              ORDER BY m.seq DESC
-             LIMIT $1",
+             LIMIT $3",
         )
-        .bind(limit)
+        .bind(room)
+        .bind(before)
+        .bind(limit + 1)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
+        let has_more = rows.len() as i64 > limit;
+        let messages = rows
             .into_iter()
+            .take(limit.max(0) as usize)
             .rev()
             .map(|row| ChatMessage {
                 id: row.get("id"),
+                room: row.get("room_id"),
                 author: row.get("author"),
                 text: row.get("body"),
                 sent_at: row.get("sent_at"),
             })
-            .collect())
+            .collect();
+
+        Ok((messages, has_more))
     }
 
     /// Сохраняет личное сообщение с идентификаторами отправителя и получателя.
@@ -460,9 +542,10 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    fn public(text: &str) -> ChatMessage {
+    fn public(room: &str, text: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            room: room.to_owned(),
             author: "Алиса".to_owned(),
             text: text.to_owned(),
             sent_at: Utc::now(),
@@ -505,14 +588,46 @@ mod tests {
             .unwrap()
             .expect("create Боб");
 
-        db.save_public(&public("первое"), alice.id).await.unwrap();
-        db.save_public(&public("второе"), alice.id).await.unwrap();
+        // Комнаты создаются при подключении, даже если база была пустой.
+        let rooms = db.load_rooms().await.unwrap();
+        assert_eq!(
+            rooms
+                .iter()
+                .map(|room| room.id.as_str())
+                .collect::<Vec<_>>(),
+            ["general", "rust", "random"]
+        );
+
+        let first = public("general", "первое");
+        let second = public("general", "второе");
+        db.save_public(&first, alice.id).await.unwrap();
+        db.save_public(&second, alice.id).await.unwrap();
+        db.save_public(&public("rust", "про Rust"), alice.id)
+            .await
+            .unwrap();
 
         // Лимит соблюдается, а последнее сообщение считается самым новым.
-        let history = db.load_public_history(1).await.unwrap();
+        let (history, has_more) = db.load_public_history("general", 1).await.unwrap();
         assert_eq!(history.len(), 1, "limit is respected");
         assert_eq!(history[0].text, "второе", "newest message wins");
         assert_eq!(history[0].author, "Алиса", "author is joined from accounts");
+        assert_eq!(history[0].room, "general");
+        assert!(has_more, "older messages are reported");
+
+        // Страница перед `второе` возвращает `первое` и больше ничего.
+        let (older, more) = db
+            .load_public_page("general", Some(second.id), 1)
+            .await
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].text, "первое");
+        assert!(!more);
+
+        // Комнаты не смешиваются.
+        let (rust, more) = db.load_public_history("rust", 10).await.unwrap();
+        assert_eq!(rust.len(), 1);
+        assert_eq!(rust[0].text, "про Rust");
+        assert!(!more);
 
         db.save_direct(&direct("Алиса", "Боб", "привет"), alice.id, bob.id)
             .await

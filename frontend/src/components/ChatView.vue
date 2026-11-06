@@ -2,16 +2,21 @@
 // Экран чата: боковая панель с диалогами и участниками, лента и поле ввода.
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { type ConnectionStatus } from '../composables/useChat'
-import type { ConversationSummary, TimelineItem } from '../types'
+import type { ConversationSummary, Room, TimelineItem } from '../types'
 import MessageBubble from './MessageBubble.vue'
 
 // Компонент не хранит состояние чата — только получает его через props.
 const props = defineProps<{
   me: string
   users: string[]
+  rooms: Room[]
+  activeRoom: string
   timeline: TimelineItem[]
   conversations: ConversationSummary[]
   activePeer: string | null
+  typingUsers: string[]
+  canLoadOlder: boolean
+  loadingHistory: boolean
   status: ConnectionStatus
   error: string
   passwordBusy: boolean
@@ -19,10 +24,14 @@ const props = defineProps<{
   passwordNotice: string
 }>()
 
-// События наружу: отправка сообщения, выбор диалога, выход и переподключение.
+// События наружу: отправка сообщения, выбор комнаты или диалога, история,
+// «печатает…», выход и переподключение.
 const emit = defineEmits<{
   send: [text: string]
   openConversation: [peer: string | null]
+  openRoom: [room: string]
+  loadOlder: []
+  typing: []
   leave: []
   reconnect: []
   changePassword: [current: string, next: string]
@@ -45,6 +54,8 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null)
 // Прижата ли лента к низу: если пользователь листает историю, не дёргаем её.
 const pinnedToBottom = ref(true)
 const sidebarOpen = ref(false)
+// Расстояние от низа ленты до прокрутки: сохраняет позицию при подгрузке старых сообщений.
+let historyAnchorOffset: number | null = null
 
 // Форма смены пароля. Поля живут в компоненте, а запрос выполняет хук чата.
 const passwordOpen = ref(false)
@@ -73,8 +84,13 @@ const passwordLocalError = computed(() => {
   return ''
 })
 
-// Открыт личный диалог (иначе показан общий канал).
+// Открыт личный диалог (иначе показана комната).
 const isDirect = computed(() => props.activePeer !== null)
+
+// Название открытой комнаты для шапки и подсказок.
+const activeRoomTitle = computed(
+  () => props.rooms.find((room) => room.id === props.activeRoom)?.title ?? 'Общий',
+)
 
 // В сети ли собеседник открытого диалога.
 const peerOnline = computed(() => {
@@ -116,7 +132,7 @@ const subtitle = computed(() => {
       ? 'Личная переписка · в сети'
       : 'Личная переписка · не в сети'
   }
-  return `Общий канал · ${props.users.length} онлайн`
+  return `${activeRoomTitle.value} · ${props.users.length} онлайн`
 })
 
 // Текст-заполнитель поля ввода зависит от состояния соединения и диалога.
@@ -125,7 +141,7 @@ const placeholder = computed(() => {
     return 'Нет соединения'
   }
   if (!props.activePeer) {
-    return 'Напишите сообщение…'
+    return `Напишите в #${props.activeRoom || 'general'}…`
   }
   if (!peerOnline.value) {
     return 'Пользователь не в сети'
@@ -145,7 +161,22 @@ const emptyText = computed(() => {
   if (props.activePeer) {
     return `Пока ни одного сообщения. Напишите ${props.activePeer} — это увидите только вы вдвоём.`
   }
-  return 'Пока тихо. Напишите первым — сообщение увидят все, кто сейчас в чате.'
+  return `Пока тихо в #${props.activeRoom || 'general'}. Напишите первым — сообщение увидят все, кто сейчас в комнате.`
+})
+
+// Строка «печатает…» под лентой.
+const typingText = computed(() => {
+  const names = props.typingUsers
+  if (names.length === 0) {
+    return ''
+  }
+  if (names.length === 1) {
+    return `${names[0]} печатает…`
+  }
+  if (names.length === 2) {
+    return `${names[0]} и ${names[1]} печатают…`
+  }
+  return 'Несколько человек печатают…'
 })
 
 // Время в формате «ЧЧ:ММ».
@@ -226,6 +257,27 @@ function open(peer: string | null) {
   emit('openConversation', peer)
 }
 
+/** Переключает комнату и закрывает мобильную панель. */
+function openRoom(room: string) {
+  sidebarOpen.value = false
+  emit('openRoom', room)
+}
+
+/** Подгружает старые сообщения, запоминая текущую позицию прокрутки. */
+function loadOlder() {
+  const el = listEl.value
+  historyAnchorOffset = el ? el.scrollHeight - el.scrollTop : null
+  emit('loadOlder')
+}
+
+/** Обновляет высоту поля ввода и сообщает серверу, что пользователь печатает. */
+function onComposerInput() {
+  resize()
+  if (!isDirect.value) {
+    emit('typing')
+  }
+}
+
 /** Открывает форму смены пароля и убирает старые сообщения. */
 function openPasswordForm() {
   passwordOpen.value = true
@@ -279,27 +331,48 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-// При смене диалога очищаем черновик и прокручиваем новую ленту вниз.
-watch(
-  () => props.activePeer,
-  async () => {
-    draft.value = ''
-    pinnedToBottom.value = true
-    await nextTick()
-    resize()
-    scrollToBottom()
-  },
-)
+/** Готовит ленту к показу: очищает черновик и прокручивает вниз. */
+async function resetTimelineView() {
+  draft.value = ''
+  pinnedToBottom.value = true
+  historyAnchorOffset = null
+  await nextTick()
+  resize()
+  scrollToBottom()
+}
+
+// При смене диалога или комнаты очищаем черновик и прокручиваем новую ленту вниз.
+watch(() => props.activePeer, resetTimelineView)
+watch(() => props.activeRoom, resetTimelineView)
 
 // Новые сообщения прокручиваем только если пользователь не читает историю выше.
 watch(
-  () => props.timeline.length,
+  () => props.timeline[props.timeline.length - 1]?.id,
   async () => {
     if (!pinnedToBottom.value) {
       return
     }
     await nextTick()
     scrollToBottom()
+  },
+)
+
+// После подгрузки старых сообщений возвращаем прокрутку к тому же месту.
+watch(
+  () => props.timeline[0]?.id,
+  async (firstId, previous) => {
+    if (historyAnchorOffset === null || !previous || firstId === previous) {
+      return
+    }
+
+    const anchor = historyAnchorOffset
+    historyAnchorOffset = null
+    await nextTick()
+
+    const el = listEl.value
+    if (el) {
+      el.scrollTop = el.scrollHeight - anchor
+    }
   },
 )
 
@@ -329,20 +402,28 @@ onMounted(async () => {
     <!-- Затемнение фона, когда на мобильном открыта панель диалогов. -->
     <div v-if="sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
 
-    <!-- Боковая панель: общий канал, личные переписки и участники онлайн. -->
+    <!-- Боковая панель: комнаты, личные переписки и участники онлайн. -->
     <aside class="sidebar" :class="{ 'sidebar--open': sidebarOpen }">
-      <button
-        class="room room-button"
-        :class="{ 'room--active': isActive(null) }"
-        type="button"
-        @click="open(null)"
-      >
-        <span class="room-hash">#</span>
-        <div class="room-text">
-          <strong>general</strong>
-          <span>{{ users.length }} онлайн</span>
-        </div>
-      </button>
+      <div class="sidebar-section sidebar-section--rooms">
+        <p class="sidebar-label">Комнаты</p>
+        <ul class="room-list">
+          <li v-for="room in rooms" :key="room.id">
+            <button
+              class="room room-button"
+              :class="{ 'room--active': !isDirect && activeRoom === room.id }"
+              type="button"
+              :title="`Открыть комнату ${room.title}`"
+              @click="openRoom(room.id)"
+            >
+              <span class="room-hash">#</span>
+              <div class="room-text">
+                <strong>{{ room.title }}</strong>
+                <span>{{ room.id }}</span>
+              </div>
+            </button>
+          </li>
+        </ul>
+      </div>
 
       <!-- Личные диалоги: счётчик непрочитанных и время последнего сообщения. -->
       <div v-if="conversations.length" class="sidebar-section">
@@ -413,7 +494,7 @@ onMounted(async () => {
       <header class="chat-header">
         <div class="chat-heading">
           <h2 v-if="activePeer"><span class="at-sign">@</span> {{ activePeer }}</h2>
-          <h2 v-else><span class="room-hash">#</span> general</h2>
+          <h2 v-else><span class="room-hash">#</span> {{ activeRoom || 'general' }}</h2>
           <span class="chat-subtitle">{{ subtitle }}</span>
         </div>
         <div class="chat-actions">
@@ -457,6 +538,17 @@ onMounted(async () => {
 
       <!-- Лента сообщений: системные уведомления и обычные сообщения. -->
       <div ref="listEl" class="messages" @scroll="onScroll">
+        <!-- Подгрузка более старой истории: доступна в комнатах. -->
+        <button
+          v-if="!isDirect && canLoadOlder"
+          class="history-button"
+          type="button"
+          :disabled="loadingHistory"
+          @click="loadOlder"
+        >
+          {{ loadingHistory ? 'Загружаем…' : 'Показать более ранние' }}
+        </button>
+
         <p v-if="timeline.length === 0" class="empty-state">
           {{ emptyText }}
         </p>
@@ -474,6 +566,11 @@ onMounted(async () => {
         </template>
       </div>
 
+      <!-- Кто печатает в комнате; высота строки зарезервирована в стилях. -->
+      <p class="typing-indicator" aria-live="polite">
+        <span v-if="typingText">{{ typingText }}</span>
+      </p>
+
       <!-- Поле ввода: Enter отправляет, Shift+Enter переносит строку. -->
       <form class="composer" @submit.prevent="submit">
         <textarea
@@ -484,7 +581,7 @@ onMounted(async () => {
           maxlength="2000"
           :placeholder="placeholder"
           :disabled="status !== 'online' || (isDirect && !peerOnline)"
-          @input="resize"
+          @input="onComposerInput"
           @keydown="onKeydown"
         ></textarea>
 

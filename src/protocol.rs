@@ -15,6 +15,25 @@ pub const MAX_NAME_LEN: usize = 24;
 /// Максимальная длина текста сообщения в символах.
 pub const MAX_MESSAGE_LEN: usize = 2_000;
 
+/// Комнаты, которые создаются при первом запуске.
+///
+/// Это единственный источник истины: сервер сам вставляет их в таблицу `rooms`
+/// и синхронизирует названия при каждом старте.
+pub const DEFAULT_ROOMS: &[(&str, &str)] = &[
+    ("general", "Общий"),
+    ("rust", "Rust"),
+    ("random", "Курилка"),
+];
+
+/// Комната общего чата.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Room {
+    /// Короткий идентификатор: `general`, `rust`, `random`.
+    pub id: String,
+    /// Название, которое показывается в интерфейсе.
+    pub title: String,
+}
+
 /// Имя пользователя, прошедшее проверку.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserName(String);
@@ -100,22 +119,31 @@ impl MessageText {
 
 /// Сообщение, которое браузер отправляет серверу.
 ///
-/// Поле `type` в JSON задаёт вариант: `join`, `message`, `direct` или `read`.
+/// Поле `type` в JSON задаёт вариант: `message`, `direct`, `read`,
+/// `join_room`, `history_before` или `typing`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// Публичное сообщение в общий канал.
+    /// Публичное сообщение в текущую комнату.
     Message { text: String },
     /// Личное сообщение конкретному пользователю.
     Direct { to: String, text: String },
     /// Отмечает все личные сообщения от `peer` прочитанными текущим пользователем.
     Read { peer: String },
+    /// Переключает соединение в другую комнату и запрашивает её историю.
+    JoinRoom { room: String },
+    /// Просит более ранние сообщения комнаты до сообщения `before`.
+    HistoryBefore { room: String, before: Uuid },
+    /// Пользователь набирает текст в комнате.
+    Typing { room: String },
 }
 
 /// Сообщение общего канала: хранится в истории и рассылается всем клиентам.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
     pub id: Uuid,
+    /// Комната, в которую отправлено сообщение.
+    pub room: String,
     pub author: String,
     pub text: String,
     pub sent_at: DateTime<Utc>,
@@ -148,16 +176,35 @@ pub struct DirectThread {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Успешный вход: имя пользователя и список участников онлайн.
-    Welcome { you: String, users: Vec<String> },
-    /// Публичная история на момент подключения.
-    History { messages: Vec<ChatMessage> },
+    /// Успешный вход: имя пользователя, список участников и доступные комнаты.
+    Welcome {
+        you: String,
+        users: Vec<String>,
+        rooms: Vec<Room>,
+        /// Комната, в которой соединение начинает работу.
+        room: String,
+    },
+    /// Последние сообщения комнаты на момент подключения или переключения.
+    History {
+        room: String,
+        messages: Vec<ChatMessage>,
+        /// Есть ли в базе сообщения старше присланных.
+        has_more: bool,
+    },
+    /// Порция более ранних сообщений комнаты.
+    HistoryPage {
+        room: String,
+        messages: Vec<ChatMessage>,
+        has_more: bool,
+    },
     /// Новое сообщение общего канала.
     Message { message: ChatMessage },
     /// Новое личное сообщение.
     Direct { message: DirectMessage },
     /// Личные переписки пользователя, восстановленные из базы.
     DirectHistory { threads: Vec<DirectThread> },
+    /// Кто-то набирает текст в комнате.
+    Typing { room: String, user: String },
     /// Системное уведомление (вход или выход участника).
     System { text: String, at: DateTime<Utc> },
     /// Актуальный список участников онлайн.
@@ -221,6 +268,28 @@ mod tests {
             ClientMessage::Direct { to, text } => {
                 assert_eq!(to, "Боб");
                 assert_eq!(text, "привет");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_room_commands() {
+        let joined: ClientMessage =
+            serde_json::from_str(r#"{"type":"join_room","room":"rust"}"#).unwrap();
+        match joined {
+            ClientMessage::JoinRoom { room } => assert_eq!(room, "rust"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let before: ClientMessage = serde_json::from_str(
+            r#"{"type":"history_before","room":"general","before":"00000000-0000-0000-0000-000000000000"}"#,
+        )
+        .unwrap();
+        match before {
+            ClientMessage::HistoryBefore { room, before } => {
+                assert_eq!(room, "general");
+                assert_eq!(before, Uuid::nil());
             }
             other => panic!("unexpected message: {other:?}"),
         }

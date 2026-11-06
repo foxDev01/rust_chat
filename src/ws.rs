@@ -28,7 +28,9 @@ use uuid::Uuid;
 
 use crate::{
     auth::{self, Account},
-    protocol::{ChatMessage, ClientMessage, DirectMessage, MessageText, ServerMessage, UserName},
+    protocol::{
+        ChatMessage, ClientMessage, DirectMessage, MessageText, Room, ServerMessage, UserName,
+    },
     state::{ChatState, PERSONAL_QUEUE},
 };
 
@@ -198,8 +200,23 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
     // живёт отдельно, а имя в списке участников показывается один раз.
     let (users, first_window) = state.join(id, &account, &token_hash, inbox).await;
 
+    // Соединение слушает одну комнату; остальные события отфильтровываются,
+    // чтобы клиент не получал чужие сообщения и не тратил на них трафик.
+    let rooms = state.rooms().await;
+    let mut current_room = state.initial_room().await;
+
     // Приветствие, публичная история и личные переписки.
-    if !send_initial(&mut sink, &state, &account, &name, users).await {
+    if !send_initial(
+        &mut sink,
+        &state,
+        &account,
+        &name,
+        users,
+        rooms,
+        current_room.clone(),
+    )
+    .await
+    {
         state.leave(id).await;
         let _ = sink.close().await;
         return;
@@ -230,7 +247,17 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
 
                 match message {
                     Message::Text(text) => {
-                        if !handle_text(text.as_str(), id, &account, &name, &state, &mut sink).await {
+                        if !handle_text(
+                            text.as_str(),
+                            id,
+                            &account,
+                            &name,
+                            &state,
+                            &mut sink,
+                            &mut current_room,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -257,6 +284,11 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
             event = events.recv() => {
                 match event {
                     Ok(event) => {
+                        // Сообщения и «печатает…» относятся к конкретной комнате:
+                        // остальное соединению не нужно.
+                        let Some(event) = event_for_room(event, &current_room) else {
+                            continue;
+                        };
                         if send_json(&mut sink, &event).await.is_err() {
                             break;
                         }
@@ -311,26 +343,39 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
     debug!(%id, "connection closed");
 }
 
-/// Отправляет приветствие, историю и личные переписки. `false` — если сокет закрылся.
+/// Оставляет событие, только если оно относится к открытой комнате.
+///
+/// Системные уведомления и список участников общие для всех комнат.
+fn event_for_room(event: ServerMessage, room: &str) -> Option<ServerMessage> {
+    match &event {
+        ServerMessage::Message { message } if message.room != room => None,
+        ServerMessage::Typing { room: target, .. } if target != room => None,
+        _ => Some(event),
+    }
+}
+
+/// Отправляет приветствие, историю комнаты и личные переписки.
+/// `false` — если сокет закрылся.
 async fn send_initial(
     sink: &mut SocketSink,
     state: &ChatState,
     account: &Account,
     name: &UserName,
     users: Vec<String>,
+    rooms: Vec<Room>,
+    room: String,
 ) -> bool {
     let welcome = ServerMessage::Welcome {
         you: name.to_string(),
         users,
+        rooms,
+        room: room.clone(),
     };
     if send_json(sink, &welcome).await.is_err() {
         return false;
     }
 
-    let history = ServerMessage::History {
-        messages: state.history().await,
-    };
-    if send_json(sink, &history).await.is_err() {
+    if !send_history(sink, state, &room, None).await {
         return false;
     }
 
@@ -348,6 +393,34 @@ async fn send_initial(
     true
 }
 
+/// Отправляет историю комнаты: последние сообщения или страницу перед `before`.
+async fn send_history(
+    sink: &mut SocketSink,
+    state: &ChatState,
+    room: &str,
+    before: Option<Uuid>,
+) -> bool {
+    let (messages, has_more) = match before {
+        Some(before) => state.history_page(room, before).await,
+        None => state.initial_history(room).await,
+    };
+
+    let message = match before {
+        Some(_) => ServerMessage::HistoryPage {
+            room: room.to_owned(),
+            messages,
+            has_more,
+        },
+        None => ServerMessage::History {
+            room: room.to_owned(),
+            messages,
+            has_more,
+        },
+    };
+
+    send_json(sink, &message).await.is_ok()
+}
+
 /// Обрабатывает один текстовый кадр клиента.
 ///
 /// Возвращает `false`, если соединение нужно закрыть (например, не удалось отправить ответ).
@@ -358,6 +431,7 @@ async fn handle_text(
     author: &UserName,
     state: &ChatState,
     sink: &mut SocketSink,
+    current_room: &mut String,
 ) -> bool {
     // Неизвестный или битый JSON — просто ошибка протокола, соединение не рвём.
     let message = match serde_json::from_str::<ClientMessage>(raw) {
@@ -377,13 +451,43 @@ async fn handle_text(
 
             let message = ChatMessage {
                 id: Uuid::new_v4(),
+                room: current_room.clone(),
                 author: author.to_string(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
             };
 
-            // Публикация сама сохранит сообщение и разошлёт его всем.
+            // Публикация сама сохранит сообщение и разошлёт его всем;
+            // соединения отфильтруют чужие комнаты.
             state.publish(message, account.id).await;
+            true
+        }
+        ClientMessage::JoinRoom { room } => {
+            if !state.is_room(&room).await {
+                return send_error(sink, "Такой комнаты нет").await;
+            }
+
+            *current_room = room;
+            send_history(sink, state, current_room, None).await
+        }
+        ClientMessage::HistoryBefore { room, before } => {
+            // Страница запрашивается только для открытой комнаты: иначе после
+            // быстрого переключения она попала бы не в ту ленту.
+            if room != *current_room {
+                return send_error(sink, "Сначала переключитесь в эту комнату").await;
+            }
+
+            send_history(sink, state, &room, Some(before)).await
+        }
+        ClientMessage::Typing { room } => {
+            if room != *current_room {
+                return send_error(sink, "Сначала переключитесь в эту комнату").await;
+            }
+
+            state.broadcast(ServerMessage::Typing {
+                room,
+                user: author.to_string(),
+            });
             true
         }
         ClientMessage::Direct { to, text } => {

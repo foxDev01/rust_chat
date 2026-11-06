@@ -1,6 +1,16 @@
-/** Публичное сообщение общего канала (совпадает с `ChatMessage` в `src/protocol.rs`). */
+/** Комната общего чата. */
+export interface Room {
+  /** Короткий идентификатор: `general`, `rust`, `random`. */
+  id: string
+  /** Название для интерфейса. */
+  title: string
+}
+
+/** Публичное сообщение комнаты (совпадает с `ChatMessage` в `src/protocol.rs`). */
 export interface ChatMessage {
   id: string
+  /** Комната, в которую отправлено сообщение. */
+  room: string
   author: string
   text: string
   sent_at: string
@@ -17,11 +27,13 @@ export interface DirectMessage {
 
 /** Сообщения, которые присылает сервер на Rust (см. `src/protocol.rs`). */
 export type ServerMessage =
-  | { type: 'welcome'; you: string; users: string[] }
-  | { type: 'history'; messages: ChatMessage[] }
+  | { type: 'welcome'; you: string; users: string[]; rooms: Room[]; room: string }
+  | { type: 'history'; room: string; messages: ChatMessage[]; has_more: boolean }
+  | { type: 'history_page'; room: string; messages: ChatMessage[]; has_more: boolean }
   | { type: 'message'; message: ChatMessage }
   | { type: 'direct'; message: DirectMessage }
   | { type: 'direct_history'; threads: DirectThread[] }
+  | { type: 'typing'; room: string; user: string }
   | { type: 'system'; text: string; at: string }
   | { type: 'users'; users: string[] }
   | { type: 'error'; message: string }
@@ -32,6 +44,9 @@ export type ClientMessage =
   | { type: 'message'; text: string }
   | { type: 'direct'; to: string; text: string }
   | { type: 'read'; peer: string }
+  | { type: 'join_room'; room: string }
+  | { type: 'history_before'; room: string; before: string }
+  | { type: 'typing'; room: string }
 
 /** Режим формы входа: существующий аккаунт или создание нового. */
 export type AuthMode = 'login' | 'register'
