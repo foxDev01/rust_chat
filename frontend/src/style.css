@@ -1173,6 +1173,35 @@ button:disabled {
   font-size: 12.5px;
 }
 
+/* Прогресс отправки файла: полоса и подпись «имя · NN%». */
+.upload-progress {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.upload-progress__track {
+  flex: 1;
+  height: 6px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.upload-progress__fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-deep));
+  transition: width 0.2s ease;
+}
+
+.upload-progress__label {
+  color: #6f788d;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .composer-input {
   flex: 1;
   min-height: 46px;

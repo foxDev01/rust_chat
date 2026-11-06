@@ -23,6 +23,8 @@ const {
   passwordError,
   passwordNotice,
   uploading,
+  uploadProgress,
+  uploadingFile,
   connect,
   reconnect,
   leave,
@@ -69,6 +71,8 @@ const {
         :password-error="passwordError"
         :password-notice="passwordNotice"
         :uploading="uploading"
+        :upload-progress="uploadProgress"
+        :uploading-file="uploadingFile"
         :load-attachment="loadAttachment"
         :download-attachment="downloadAttachment"
         @send="post"

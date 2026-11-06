@@ -24,6 +24,10 @@ const props = defineProps<{
   passwordNotice: string
   /** Идёт загрузка файла на сервер. */
   uploading: boolean
+  /** Процент отправки файла (0–100) или `null` вне загрузки. */
+  uploadProgress: number | null
+  /** Имя файла, который отправляется прямо сейчас. */
+  uploadingFile: string
   /** Готовит blob-ссылку файла для показа и скачивания. */
   loadAttachment: (id: string) => Promise<string>
   /** Скачивает файл сообщения. */
@@ -636,7 +640,20 @@ onMounted(async () => {
       <!-- Поле ввода: Enter отправляет, Shift+Enter переносит строку. -->
       <form class="composer" @submit.prevent="submit">
         <!-- Выбранный файл: подпись с именем и кнопка отмены. -->
-        <div v-if="selectedFile || fileError" class="file-row">
+        <div v-if="uploading" class="upload-progress">
+          <div class="upload-progress__track">
+            <div
+              class="upload-progress__fill"
+              :style="{ width: (uploadProgress ?? 0) + '%' }"
+            ></div>
+          </div>
+          <span class="upload-progress__label">
+            {{ uploadingFile }} · {{ uploadProgress ?? 0 }}%
+          </span>
+        </div>
+
+        <!-- Выбранный файл: подпись с именем и кнопка отмены. -->
+        <div v-else-if="selectedFile || fileError" class="file-row">
           <p v-if="fileError" class="file-error banner--error">{{ fileError }}</p>
           <span v-else class="file-chip">
             <span class="file-chip__name">{{ selectedFile?.name }}</span>

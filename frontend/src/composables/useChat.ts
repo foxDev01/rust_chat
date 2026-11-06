@@ -149,11 +149,17 @@ export function useChat() {
 
   /** Идёт ли загрузка файла на сервер. */
   const uploading = ref(false)
+  /** Процент отправки файла: 0–100 или `null` между загрузками. */
+  const uploadProgress = ref<number | null>(null)
+  /** Имя файла, который сейчас отправляется. */
+  const uploadingFile = ref('')
 
   /** Готовые blob-ссылки для превью и скачивания: идентификатор сообщения → ссылка. */
   const attachmentUrls = new Map<string, string>()
   /** Загрузки, которые уже выполняются, чтобы не качать один файл дважды. */
   const pendingAttachments = new Map<string, Promise<string>>()
+  /** Ходящая загрузка файла для отмены при выходе из аккаунта. */
+  let currentUpload: XMLHttpRequest | null = null
 
   /** Идёт ли запрос на смену пароля. */
   const passwordBusy = ref(false)
@@ -267,6 +273,7 @@ export function useChat() {
     lastTypingAt = 0
     clearTypingTimers()
     revokeAttachmentUrls()
+    abortUpload()
   }
 
   /** Удаляет токен и возвращает экран входа. */
@@ -903,6 +910,24 @@ export function useChat() {
     return send({ type: 'message', text: trimmed })
   }
 
+  /** Отменяет текущую загрузку файла, если она идёт. */
+  function abortUpload() {
+    if (currentUpload) {
+      currentUpload.abort()
+      currentUpload = null
+    }
+    uploadingFile.value = ''
+    uploadProgress.value = null
+  }
+
+  /** Очищает индикатор прогресса после завершения (или сбоя) загрузки. */
+  function finishUploadProgress() {
+    currentUpload = null
+    uploadingFile.value = ''
+    uploadProgress.value = null
+    uploading.value = false
+  }
+
   /** Загружает файл на сервер; сообщение создаёт и рассылает сам сервер. */
   async function uploadFile(file: File, caption: string): Promise<boolean> {
     const currentToken = token.value
@@ -931,18 +956,54 @@ export function useChat() {
     }
 
     uploading.value = true
+    uploadingFile.value = file.name
+    uploadProgress.value = 0
+
     try {
-      await api<{ id: string }>('/api/upload', {
-        method: 'POST',
-        headers: authHeaders(currentToken),
-        body,
+      // XHR вместо fetch: только он даёт события прогресса отправки.
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        currentUpload = xhr
+        xhr.open('POST', '/api/upload')
+        xhr.setRequestHeader('Authorization', `Bearer ${currentToken}`)
+
+        // Сколько байт уже на сервере — обновляем полосу прогресса.
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percent = Math.round((event.loaded / event.total) * 100)
+            uploadProgress.value = Math.min(percent, 99)
+          }
+        }
+
+        xhr.onload = () => {
+          // Ответ получен: байты дошли, но сервер ещё мог вернуть ошибку валидации.
+          uploadProgress.value = 100
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve()
+            return
+          }
+
+          const body = (JSON.parse(xhr.responseText) as { error?: string } | null) ?? null
+          reject(new Error(body?.error ?? `Ошибка сервера (${xhr.status})`))
+        }
+
+        xhr.onerror = () => reject(new Error('Не удалось связаться с сервером'))
+        xhr.onabort = () => reject(new Error('Загрузка отменена'))
+        xhr.send(body)
       })
+
       return true
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'Не удалось отправить файл'
+      // Отмена — добровольное действие, не считаем его ошибкой.
+      const aborted = cause instanceof Error && cause.message === 'Загрузка отменена'
+      error.value = aborted
+        ? ''
+        : cause instanceof Error
+          ? cause.message
+          : 'Не удалось отправить файл'
       return false
     } finally {
-      uploading.value = false
+      finishUploadProgress()
     }
   }
 
@@ -974,6 +1035,8 @@ export function useChat() {
     passwordError,
     passwordNotice,
     uploading,
+    uploadProgress,
+    uploadingFile,
     connect,
     reconnect,
     leave,
