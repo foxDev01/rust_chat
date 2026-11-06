@@ -6,14 +6,29 @@ export interface Room {
   title: string
 }
 
+/** Файл, прикреплённый к сообщению (совпадает с `Attachment` в `src/protocol.rs`). */
+export interface Attachment {
+  /** Совпадает с идентификатором сообщения: по нему скачивается файл. */
+  id: string
+  /** Исходное имя файла без пути. */
+  name: string
+  /** MIME-тип, присланный браузером при загрузке. */
+  mime: string
+  /** Размер файла в байтах. */
+  size: number
+}
+
 /** Публичное сообщение комнаты (совпадает с `ChatMessage` в `src/protocol.rs`). */
 export interface ChatMessage {
   id: string
   /** Комната, в которую отправлено сообщение. */
   room: string
   author: string
+  /** Может быть пустым, если отправлен только файл. */
   text: string
   sent_at: string
+  /** Заполняется у сообщений с файлом. */
+  attachment?: Attachment
 }
 
 /** Личное сообщение между двумя пользователями. */
@@ -21,8 +36,11 @@ export interface DirectMessage {
   id: string
   from: string
   to: string
+  /** Может быть пустым, если отправлен только файл. */
   text: string
   sent_at: string
+  /** Заполняется у сообщений с файлом. */
+  attachment?: Attachment
 }
 
 /** Сообщения, которые присылает сервер на Rust (см. `src/protocol.rs`). */
@@ -85,10 +103,13 @@ export interface ChatItem {
   kind: 'chat'
   id: string
   author: string
+  /** Может быть пустым, если отправлен только файл. */
   text: string
   sentAt: string
   /** Заполняется у личных сообщений: кому адресовано. */
   recipient?: string
+  /** Заполняется у сообщений с файлом. */
+  attachment?: Attachment
 }
 
 /** Элемент ленты: системное уведомление о входе или выходе. */

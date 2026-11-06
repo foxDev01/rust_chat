@@ -931,6 +931,110 @@ button:disabled {
   color: #fff;
 }
 
+/* ---------- Вложения ---------- */
+
+/* Контейнер файла внутри сообщения: без отступов ниже текста. */
+.attachment {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  min-width: 0;
+}
+
+/* Превью картинки: клик скачивает файл. */
+.attachment-image {
+  max-width: 100%;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #0e1118;
+}
+
+.attachment-image img {
+  display: block;
+  max-width: min(360px, 100%);
+  max-height: 280px;
+}
+
+/* Карточка файла: имя и размер, клик скачивает файл. */
+.attachment-file {
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  max-width: min(360px, 100%);
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-strong);
+  text-decoration: none;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.attachment-file:hover {
+  border-color: rgba(255, 107, 61, 0.4);
+  background: rgba(255, 107, 61, 0.07);
+}
+
+/* Под превью: строка с именем и размером картинки. */
+.attachment-caption {
+  color: #6f788d;
+  font-size: 11px;
+}
+
+.message--own .attachment-caption {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+/* Свои файлы — в цвета исходящих сообщений. */
+.message--own .attachment-file {
+  border-color: rgba(255, 154, 112, 0.28);
+  background: linear-gradient(140deg, rgba(255, 107, 61, 0.35), rgba(224, 69, 31, 0.35));
+}
+
+.message--own .attachment-file:hover {
+  border-color: rgba(255, 154, 112, 0.5);
+  background: linear-gradient(140deg, rgba(255, 107, 61, 0.45), rgba(224, 69, 31, 0.45));
+}
+
+.attachment-icon {
+  flex: 0 0 auto;
+  font-size: 22px;
+}
+
+.attachment-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c6cddd;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.message--own .attachment-name {
+  color: #fff;
+}
+
+.attachment-size {
+  color: #6f788d;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.message--own .attachment-size {
+  color: rgba(255, 255, 255, 0.75);
+}
+
 .avatar {
   display: grid;
   place-items: center;
@@ -971,11 +1075,102 @@ button:disabled {
 
 .composer {
   display: flex;
-  gap: 10px;
-  align-items: flex-end;
+  flex-direction: column;
+  gap: 8px;
   padding: 14px 20px 4px;
   border-top: 1px solid var(--border);
   background: rgba(18, 21, 29, 0.6);
+}
+
+/* Ряд ввода: кнопка файла, textarea и кнопка отправки. */
+.composer-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+/* Скрытый input[type=file]: открывается из кнопки 📎. */
+.attach-input {
+  display: none;
+}
+
+/* Кнопка прикрепления файла. */
+.attach-button {
+  flex: 0 0 44px;
+  height: 46px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 18px;
+  line-height: 1;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.15s ease;
+}
+
+.attach-button:hover:not(:disabled) {
+  border-color: rgba(255, 107, 61, 0.4);
+  background: rgba(255, 107, 61, 0.08);
+  transform: translateY(-1px);
+}
+
+.attach-button:disabled {
+  opacity: 0.45;
+}
+
+/* Строка с выбранным файлом или ошибкой его выбора. */
+.file-row {
+  display: flex;
+}
+
+.file-chip {
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 107, 61, 0.3);
+  border-radius: 12px;
+  background: rgba(255, 107, 61, 0.08);
+  font-size: 12.5px;
+}
+
+.file-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c6cddd;
+  font-weight: 600;
+}
+
+.file-chip__size {
+  color: #6f788d;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-chip__remove {
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: #6f788d;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.file-chip__remove:hover {
+  color: #ffb3b9;
+}
+
+.file-error {
+  margin: 0;
+  padding: 6px 12px;
+  border: 1px solid rgba(255, 100, 112, 0.35);
+  border-radius: 12px;
+  background: rgba(255, 100, 112, 0.12);
+  color: #ffb3b9;
+  font-size: 12.5px;
 }
 
 .composer-input {

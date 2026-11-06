@@ -455,6 +455,7 @@ async fn handle_text(
                 author: author.to_string(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
+                attachment: None,
             };
 
             // Публикация сама сохранит сообщение и разошлёт его всем;
@@ -502,7 +503,7 @@ async fn handle_text(
             };
 
             // Личные сообщения доставляются только тем, кто сейчас онлайн.
-            // У получателя может быть открыто несколько окон — шлём в каждое.
+            // У получателя может быть открыто несколько окон — доставляем в каждое.
             let connections = state.connections(recipient.as_str()).await;
             let Some(recipient_connection) = connections.first() else {
                 return send_error(sink, "Пользователь не в сети").await;
@@ -520,53 +521,17 @@ async fn handle_text(
                 to: recipient_connection.name.clone(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
+                attachment: None,
             };
 
-            // Сначала сохраняем: восстановленный диалог не должен потерять
-            // сообщение, которое клиент уже получил. В базе участники диалога
-            // хранятся как account_id.
-            state
-                .save_direct(&message, account.id, recipient_connection.account_id)
-                .await;
-
-            let mut delivered = 0;
-            for connection in &connections {
-                if connection.id == id {
-                    continue;
-                }
-
-                if state
-                    .send_to(
-                        connection.id,
-                        ServerMessage::Direct {
-                            message: message.clone(),
-                        },
-                    )
-                    .await
-                {
-                    delivered += 1;
-                }
-            }
-
-            if delivered == 0 {
+            // Запись в базу и доставка во все окна обоих участников общие
+            // с HTTP-загрузкой файлов.
+            if state
+                .deliver_direct(&message, account.id, recipient_connection.account_id)
+                .await
+                == 0
+            {
                 return send_error(sink, "Не удалось доставить сообщение").await;
-            }
-
-            // Копию отправителю шлём в его текущий сокет, а остальным окнам
-            // того же аккаунта — через их личные очереди.
-            for connection in state.connections(author.as_str()).await {
-                if connection.id == id {
-                    continue;
-                }
-
-                state
-                    .send_to(
-                        connection.id,
-                        ServerMessage::Direct {
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
             }
 
             send_json(sink, &ServerMessage::Direct { message })

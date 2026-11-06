@@ -15,12 +15,13 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::{self, Account, AuthError, AuthSession};
-use crate::db::{ChatDb, THREAD_REPLAY};
+use crate::db::{ChatDb, StoredAttachment, THREAD_REPLAY};
 use crate::protocol::{
     ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, ServerMessage, UserName,
     name_key,
 };
 use crate::rate_limit::{LOGIN_QUOTA, REGISTER_QUOTA, RateLimiter};
+use crate::uploads::Uploads;
 
 /// Сколько последних сообщений комнаты получает новый клиент при подключении.
 pub const HISTORY_LIMIT: usize = 100;
@@ -52,6 +53,8 @@ struct Inner {
     /// Лимиты попыток входа и регистрации по IP-адресу.
     login_limiter: RateLimiter,
     register_limiter: RateLimiter,
+    /// Хранилище файлов, прикрепляемых к сообщениям.
+    uploads: Uploads,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
     db: Option<ChatDb>,
 }
@@ -85,11 +88,11 @@ pub struct Connection {
 impl ChatState {
     /// Состояние только в памяти: используется тестами и внутри [`ChatState::persisted`].
     pub fn new() -> Self {
-        Self::with_db(None)
+        Self::with_db(None, Uploads::default())
     }
 
     /// Восстанавливает публичную историю из PostgreSQL, чтобы перезапуск её не терял.
-    pub async fn persisted(db: ChatDb) -> Result<Self, sqlx::Error> {
+    pub async fn persisted(db: ChatDb, uploads: Uploads) -> Result<Self, sqlx::Error> {
         // Попутно чистим сессии, срок которых уже истёк.
         if let Err(error) = db.purge_expired_sessions().await {
             warn!(%error, "failed to purge expired sessions");
@@ -106,7 +109,7 @@ impl ChatState {
             stored.insert(room.id.clone(), VecDeque::from(messages));
         }
 
-        let state = Self::with_db(Some(db));
+        let state = Self::with_db(Some(db), uploads);
 
         *state.inner.rooms.write().await = rooms;
         *state.inner.history.write().await = stored;
@@ -115,7 +118,7 @@ impl ChatState {
     }
 
     /// Создаёт состояние с указанным (или отсутствующим) хранилищем.
-    fn with_db(db: Option<ChatDb>) -> Self {
+    fn with_db(db: Option<ChatDb>, uploads: Uploads) -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
 
         // Без базы комнаты берутся из кода: тесты работают с тем же набором,
@@ -140,6 +143,7 @@ impl ChatState {
                 history: RwLock::new(history),
                 login_limiter: RateLimiter::new(LOGIN_QUOTA),
                 register_limiter: RateLimiter::new(REGISTER_QUOTA),
+                uploads,
                 db,
             }),
         }
@@ -553,6 +557,58 @@ impl ChatState {
         }
     }
 
+    /// Сохраняет личное сообщение и кладёт его в очереди всех окон обоих участников.
+    ///
+    /// Соединения ищутся по `account_id`, поэтому имени не нужно совпадать в
+    /// регистре, а копия автора доставляется в каждое его окно. Возвращает,
+    /// сколько окон получателя приняли сообщение: если ноль, получатель уже
+    /// отключился и сообщение стоит считать недоставленным.
+    pub async fn deliver_direct(
+        &self,
+        message: &DirectMessage,
+        sender_id: Uuid,
+        recipient_id: Uuid,
+    ) -> usize {
+        // Сначала запись: восстановленный диалог не должен потерять сообщение,
+        // которое клиент уже получил.
+        self.save_direct(message, sender_id, recipient_id).await;
+
+        let event = ServerMessage::Direct {
+            message: message.clone(),
+        };
+
+        let mut delivered_recipient = 0;
+        for connection in [
+            self.connections_by_account(sender_id).await,
+            self.connections_by_account(recipient_id).await,
+        ]
+        .concat()
+        {
+            if self.send_to(connection.id, event.clone()).await
+                && connection.account_id == recipient_id
+            {
+                delivered_recipient += 1;
+            }
+        }
+
+        delivered_recipient
+    }
+
+    /// Все соединения аккаунта (в отличие от [`ChatState::connections`] — по имени).
+    async fn connections_by_account(&self, account_id: Uuid) -> Vec<Connection> {
+        let users = self.inner.users.read().await;
+
+        users
+            .iter()
+            .filter(|(_, user)| user.account_id == account_id)
+            .map(|(id, user)| Connection {
+                id: *id,
+                name: user.name.clone(),
+                account_id: user.account_id,
+            })
+            .collect()
+    }
+
     /// Личные переписки аккаунта из базы.
     ///
     /// Если собеседник сейчас онлайн, имя приводится к написанию, под которым он вошёл.
@@ -595,6 +651,28 @@ impl ChatState {
         {
             warn!(%error, "failed to store a read mark");
         }
+    }
+
+    /// Хранилище файлов, прикрепляемых к сообщениям.
+    pub fn uploads(&self) -> &Uploads {
+        &self.inner.uploads
+    }
+
+    /// Максимальный размер одного вложения в байтах.
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.inner.uploads.max_bytes()
+    }
+
+    /// Метаданные файла сообщения с проверкой доступа аккаунта.
+    ///
+    /// `None` также приходит при ошибке базы: сообщаем клиенту «файл не
+    /// найден» вместо утечки деталей хранилища.
+    pub async fn attachment(&self, message_id: Uuid, account_id: Uuid) -> Option<StoredAttachment> {
+        let db = self.inner.db.as_ref()?;
+        db.find_attachment(message_id, account_id)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Количество строк в хранилище; `None`, если базы нет.
@@ -648,6 +726,7 @@ mod tests {
             author: author.to_owned(),
             text: value.to_owned(),
             sent_at: Utc::now(),
+            attachment: None,
         }
     }
 
@@ -658,6 +737,7 @@ mod tests {
             to: to.to_owned(),
             text: value.to_owned(),
             sent_at: Utc::now(),
+            attachment: None,
         }
     }
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Экран чата: боковая панель с диалогами и участниками, лента и поле ввода.
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { type ConnectionStatus } from '../composables/useChat'
+import { MAX_FILE_BYTES, type ConnectionStatus } from '../composables/useChat'
 import type { ConversationSummary, Room, TimelineItem } from '../types'
 import MessageBubble from './MessageBubble.vue'
 
@@ -22,12 +22,18 @@ const props = defineProps<{
   passwordBusy: boolean
   passwordError: string
   passwordNotice: string
+  /** Идёт загрузка файла на сервер. */
+  uploading: boolean
+  /** Готовит blob-ссылку файла для показа и скачивания. */
+  loadAttachment: (id: string) => Promise<string>
+  /** Скачивает файл сообщения. */
+  downloadAttachment: (id: string, name: string) => void
 }>()
 
-// События наружу: отправка сообщения, выбор комнаты или диалога, история,
-// «печатает…», выход и переподключение.
+// События наружу: отправка сообщения (с файлом или без), выбор комнаты или
+// диалога, история, «печатает…», выход и переподключение.
 const emit = defineEmits<{
-  send: [text: string]
+  send: [text: string, file: File | null]
   openConversation: [peer: string | null]
   openRoom: [room: string]
   loadOlder: []
@@ -51,6 +57,10 @@ const STATUS_LABELS: Record<ConnectionStatus, string> = {
 const draft = ref('')
 const listEl = ref<HTMLDivElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
+// Выбранный файл и открытие его средствами браузера.
+const fileInputEl = ref<HTMLInputElement | null>(null)
+const selectedFile = ref<File | null>(null)
+const fileError = ref('')
 // Прижата ли лента к низу: если пользователь листает историю, не дёргаем её.
 const pinnedToBottom = ref(true)
 const sidebarOpen = ref(false)
@@ -103,13 +113,22 @@ const peerOnline = computed(() => {
   return props.users.some((user) => normalize(user) === key)
 })
 
-// Можно ли отправить: есть соединение, получатель доступен и текст не пустой.
+// Можно ли отправить: есть соединение, получатель доступен, есть текст или файл.
 const canSend = computed(
   () =>
     props.status === 'online' &&
+    !props.uploading &&
     (!isDirect.value || peerOnline.value) &&
-    draft.value.trim().length > 0,
+    (draft.value.trim().length > 0 || selectedFile.value !== null),
 )
+
+// Подпись на кнопке: текст, файл или загрузка.
+const sendLabel = computed(() => {
+  if (props.uploading && selectedFile.value) {
+    return 'Загружаем…'
+  }
+  return selectedFile.value ? 'Отправить файл' : 'Отправить'
+})
 
 // Пояснение над лентой, если что-то мешает общению.
 const connectionNote = computed(() => {
@@ -152,8 +171,8 @@ const placeholder = computed(() => {
 // Подсказка под полем ввода.
 const composerHint = computed(() =>
   isDirect.value
-    ? 'Enter — отправить, Shift + Enter — новая строка · видят только вы двое'
-    : 'Enter — отправить, Shift + Enter — новая строка',
+    ? 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ · видят только вы двое'
+    : 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ',
 )
 
 // Что показать, пока в ленте нет сообщений.
@@ -306,14 +325,54 @@ function submitPassword() {
   emit('changePassword', currentPassword.value, newPassword.value)
 }
 
+/** Выбирает файл из диалога браузера; забирает его после подгрузки страницы. */
+function pickFile() {
+  fileInputEl.value?.click()
+}
+
+/** Проверяет выбранный файл: не слишком ли он большой. */
+function onFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] ?? null
+
+  if (file && file.size > MAX_FILE_BYTES) {
+    fileError.value = 'Файл больше 10 МБ'
+    selectedFile.value = null
+  } else {
+    fileError.value = ''
+    selectedFile.value = file
+  }
+
+  // Сброс значения позволяет выбрать тот же файл повторно.
+  input.value = ''
+}
+
+/** Убирает выбранный файл из поля ввода. */
+function clearFile() {
+  selectedFile.value = null
+  fileError.value = ''
+}
+
+/** Размер файла в понятных единицах. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} Б`
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} КБ`
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`
+}
+
 /** Отправляет черновик и возвращает ленту к низу. */
 function submit() {
   if (!canSend.value) {
     return
   }
 
-  emit('send', draft.value)
+  emit('send', draft.value, selectedFile.value)
   draft.value = ''
+  clearFile()
   pinnedToBottom.value = true
 
   nextTick(() => {
@@ -334,6 +393,7 @@ function onKeydown(event: KeyboardEvent) {
 /** Готовит ленту к показу: очищает черновик и прокручивает вниз. */
 async function resetTimelineView() {
   draft.value = ''
+  clearFile()
   pinnedToBottom.value = true
   historyAnchorOffset = null
   await nextTick()
@@ -557,13 +617,15 @@ onMounted(async () => {
           <div v-if="item.kind === 'system'" class="notice" :title="formatTime(item.at)">
             {{ item.text }}
           </div>
-          <MessageBubble
-            v-else
-            :message="item"
-            :own="item.author === me"
-            :direct="isDirect"
-          />
-        </template>
+        <MessageBubble
+          v-else
+          :message="item"
+          :own="item.author === me"
+          :direct="isDirect"
+          :load-attachment="loadAttachment"
+          :download-attachment="downloadAttachment"
+        />
+      </template>
       </div>
 
       <!-- Кто печатает в комнате; высота строки зарезервирована в стилях. -->
@@ -573,23 +635,62 @@ onMounted(async () => {
 
       <!-- Поле ввода: Enter отправляет, Shift+Enter переносит строку. -->
       <form class="composer" @submit.prevent="submit">
-        <textarea
-          ref="textareaEl"
-          v-model="draft"
-          class="composer-input"
-          rows="1"
-          maxlength="2000"
-          :placeholder="placeholder"
-          :disabled="status !== 'online' || (isDirect && !peerOnline)"
-          @input="onComposerInput"
-          @keydown="onKeydown"
-        ></textarea>
+        <!-- Выбранный файл: подпись с именем и кнопка отмены. -->
+        <div v-if="selectedFile || fileError" class="file-row">
+          <p v-if="fileError" class="file-error banner--error">{{ fileError }}</p>
+          <span v-else class="file-chip">
+            <span class="file-chip__name">{{ selectedFile?.name }}</span>
+            <span class="file-chip__size">
+              {{ selectedFile ? formatBytes(selectedFile.size) : '' }}
+            </span>
+            <button
+              class="file-chip__remove"
+              type="button"
+              aria-label="Убрать файл"
+              @click="clearFile"
+            >
+              ×
+            </button>
+          </span>
+        </div>
 
-        <div class="composer-actions">
-          <span v-if="draft.length > 1800" class="counter">{{ draft.length }}/2000</span>
-          <button class="primary-button primary-button--small" type="submit" :disabled="!canSend">
-            Отправить
+        <div class="composer-row">
+          <!-- Кнопка прикрепления файла: вызывает скрытый input. -->
+          <button
+            class="attach-button"
+            type="button"
+            title="Прикрепить файл"
+            aria-label="Прикрепить файл"
+            :disabled="status !== 'online' || uploading || (isDirect && !peerOnline)"
+            @click="pickFile"
+          >
+            📎
           </button>
+          <input
+            ref="fileInputEl"
+            class="attach-input"
+            type="file"
+            @change="onFileChange"
+          />
+
+          <textarea
+            ref="textareaEl"
+            v-model="draft"
+            class="composer-input"
+            rows="1"
+            maxlength="2000"
+            :placeholder="placeholder"
+            :disabled="status !== 'online' || (isDirect && !peerOnline)"
+            @input="onComposerInput"
+            @keydown="onKeydown"
+          ></textarea>
+
+          <div class="composer-actions">
+            <span v-if="draft.length > 1800" class="counter">{{ draft.length }}/2000</span>
+            <button class="primary-button primary-button--small" type="submit" :disabled="!canSend">
+              {{ sendLabel }}
+            </button>
+          </div>
         </div>
       </form>
 

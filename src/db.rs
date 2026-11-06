@@ -10,14 +10,14 @@ use std::error::Error;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::auth::Account;
 use crate::protocol::{
-    ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, UserName, name_key,
+    Attachment, ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, UserName, name_key,
 };
 
 /// Тайм-аут установки соединения с базой.
@@ -27,6 +27,59 @@ const MAX_CONNECTIONS: u32 = 5;
 
 /// Сколько последних сообщений одного диалога восстанавливается при входе пользователя.
 pub const THREAD_REPLAY: i64 = 100;
+
+/// Метаданные файла, загруженного вместе с сообщением; используются при скачивании.
+#[derive(Debug, Clone)]
+pub struct StoredAttachment {
+    /// Исходное имя файла.
+    pub name: String,
+    /// MIME-тип, полученный от браузера при загрузке.
+    pub mime: String,
+    /// Размер файла в байтах.
+    pub size: i64,
+}
+
+/// Собирает вложение сообщения из колонок строки результата.
+///
+/// Имя задаётся вместе с вложением, а тип и размер могли появиться на базах
+/// старой схемы, поэтому при их отсутствии подставляются разумные значения.
+fn attachment_from_row(row: &PgRow) -> Option<Attachment> {
+    let name = row.get::<Option<String>, _>("attachment_name")?;
+
+    // У сообщения с вложением имя обязательно есть; остальное — запасной путь.
+    let id: Uuid = row.get("id");
+    Some(Attachment {
+        id,
+        name,
+        mime: row
+            .try_get::<Option<String>, _>("attachment_mime")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::uploads::DEFAULT_CONTENT_TYPE.to_owned()),
+        size: row
+            .try_get::<Option<i64>, _>("attachment_size")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+    })
+}
+
+/// Собирает метаданные файла для скачивания из колонок строки результата.
+fn stored_attachment_from_row(row: &PgRow) -> StoredAttachment {
+    StoredAttachment {
+        name: row.get("attachment_name"),
+        mime: row
+            .try_get::<Option<String>, _>("attachment_mime")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::uploads::DEFAULT_CONTENT_TYPE.to_owned()),
+        size: row
+            .try_get::<Option<i64>, _>("attachment_size")
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+    }
+}
 
 /// Пул подключений к PostgreSQL.
 pub struct ChatDb {
@@ -61,6 +114,7 @@ impl ChatDb {
             include_str!("../migrations/001_init.sql"),
             include_str!("../migrations/002_account_ids.sql"),
             include_str!("../migrations/003_rooms_pagination.sql"),
+            include_str!("../migrations/004_attachments.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&pool)
@@ -274,15 +328,22 @@ impl ChatDb {
         message: &ChatMessage,
         author_id: Uuid,
     ) -> Result<(), sqlx::Error> {
+        let attachment = message.attachment.as_ref();
+
         sqlx::query(
-            "INSERT INTO chat_messages (id, room_id, author_id, body, sent_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO chat_messages
+                 (id, room_id, author_id, body, sent_at,
+                  attachment_name, attachment_mime, attachment_size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(message.id)
         .bind(&message.room)
         .bind(author_id)
         .bind(&message.text)
         .bind(message.sent_at)
+        .bind(attachment.map(|file| file.name.as_str()))
+        .bind(attachment.map(|file| file.mime.as_str()))
+        .bind(attachment.map(|file| file.size))
         .execute(&self.pool)
         .await?;
 
@@ -313,7 +374,8 @@ impl ChatDb {
         // В истории хранится только UUID автора, имя подтягиваем из аккаунта.
         // Запрашиваем на одно сообщение больше, чтобы узнать, есть ли ещё.
         let rows = sqlx::query(
-            "SELECT m.id, m.room_id, a.username AS author, m.body, m.sent_at
+            "SELECT m.id, m.room_id, a.username AS author, m.body, m.sent_at,
+                    m.attachment_name, m.attachment_mime, m.attachment_size
              FROM chat_messages m
              JOIN accounts a ON a.id = m.author_id
              WHERE m.room_id = $1
@@ -342,6 +404,7 @@ impl ChatDb {
                 author: row.get("author"),
                 text: row.get("body"),
                 sent_at: row.get("sent_at"),
+                attachment: attachment_from_row(&row),
             })
             .collect();
 
@@ -355,15 +418,22 @@ impl ChatDb {
         sender_id: Uuid,
         recipient_id: Uuid,
     ) -> Result<(), sqlx::Error> {
+        let attachment = message.attachment.as_ref();
+
         sqlx::query(
-            "INSERT INTO direct_messages (id, sender_id, recipient_id, body, sent_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO direct_messages
+                 (id, sender_id, recipient_id, body, sent_at,
+                  attachment_name, attachment_mime, attachment_size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(message.id)
         .bind(sender_id)
         .bind(recipient_id)
         .bind(&message.text)
         .bind(message.sent_at)
+        .bind(attachment.map(|file| file.name.as_str()))
+        .bind(attachment.map(|file| file.mime.as_str()))
+        .bind(attachment.map(|file| file.size))
         .execute(&self.pool)
         .await?;
 
@@ -383,6 +453,7 @@ impl ChatDb {
         let messages = sqlx::query(
             "WITH involved AS (
                  SELECT seq, id, sender_id, recipient_id, body, sent_at,
+                        attachment_name, attachment_mime, attachment_size,
                         CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS peer_id
                  FROM direct_messages
                  WHERE sender_id = $1 OR recipient_id = $1
@@ -392,7 +463,8 @@ impl ChatDb {
                  FROM involved
              )
              SELECT r.seq, r.id, s.username AS sender, rc.username AS recipient,
-                    r.body, r.sent_at, r.peer_id, p.username AS peer
+                    r.body, r.sent_at, r.peer_id, p.username AS peer,
+                    r.attachment_name, r.attachment_mime, r.attachment_size
              FROM ranked r
              JOIN accounts s ON s.id = r.sender_id
              JOIN accounts rc ON rc.id = r.recipient_id
@@ -443,6 +515,7 @@ impl ChatDb {
                 to: row.get("recipient"),
                 text: row.get("body"),
                 sent_at: row.get("sent_at"),
+                attachment: attachment_from_row(&row),
             });
         }
 
@@ -475,6 +548,45 @@ impl ChatDb {
         result.reverse();
 
         Ok(result)
+    }
+
+    /// Ищет файл по идентификатору сообщения и проверяет право доступа.
+    ///
+    /// Файлы публичных комнат может скачать любой владелец сессии, файлы
+    /// личных сообщений — только участники переписки. Сообщению без вложения
+    /// и чужому личному файлу соответствует `None`, чтобы нельзя было
+    /// отличить «нет файла» от «нет доступа».
+    pub async fn find_attachment(
+        &self,
+        message_id: Uuid,
+        account_id: Uuid,
+    ) -> Result<Option<StoredAttachment>, sqlx::Error> {
+        let public = sqlx::query(
+            "SELECT attachment_name, attachment_mime, attachment_size
+             FROM chat_messages
+             WHERE id = $1 AND attachment_name IS NOT NULL",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = public {
+            return Ok(Some(stored_attachment_from_row(&row)));
+        }
+
+        let direct = sqlx::query(
+            "SELECT attachment_name, attachment_mime, attachment_size
+             FROM direct_messages
+             WHERE id = $1
+               AND attachment_name IS NOT NULL
+               AND (sender_id = $2 OR recipient_id = $2)",
+        )
+        .bind(message_id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(direct.map(|row| stored_attachment_from_row(&row)))
     }
 
     /// Запоминает, что `account_id` прочитал всё, что `peer` отправил к этому моменту.
@@ -549,6 +661,7 @@ mod tests {
             author: "Алиса".to_owned(),
             text: text.to_owned(),
             sent_at: Utc::now(),
+            attachment: None,
         }
     }
 
@@ -559,6 +672,7 @@ mod tests {
             to: to.to_owned(),
             text: text.to_owned(),
             sent_at: Utc::now(),
+            attachment: None,
         }
     }
 
@@ -653,6 +767,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after[0].unread, 0, "read mark clears the counter");
+
+        // Вложение: метаданные переживают запись и чтение, а доступ к файлу
+        // личного сообщения есть только у участников переписки.
+        let eva = db
+            .create_account(&name("Ева"), "hash")
+            .await
+            .unwrap()
+            .expect("create Ева");
+
+        let mut with_file = public("general", "снимок экрана");
+        with_file.attachment = Some(Attachment {
+            id: with_file.id,
+            name: "снимок.png".to_owned(),
+            mime: "image/png".to_owned(),
+            size: 12,
+        });
+        db.save_public(&with_file, alice.id).await.unwrap();
+
+        let restored = db
+            .load_public_history("general", 100)
+            .await
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|message| message.id == with_file.id)
+            .expect("attachment message is in history");
+        let restored_file = restored.attachment.expect("attachment is restored");
+        assert_eq!(restored_file.name, "снимок.png");
+        assert_eq!(restored_file.mime, "image/png");
+        assert_eq!(restored_file.size, 12);
+
+        let downloaded = db
+            .find_attachment(with_file.id, eva.id)
+            .await
+            .unwrap()
+            .expect("public attachment is open to any account");
+        assert_eq!(downloaded.name, "снимок.png");
+
+        let mut private = direct("Алиса", "Боб", "смотри сюда");
+        private.attachment = Some(Attachment {
+            id: private.id,
+            name: "архив.zip".to_owned(),
+            mime: "application/zip".to_owned(),
+            size: 34,
+        });
+        db.save_direct(&private, alice.id, bob.id).await.unwrap();
+
+        assert!(
+            db.find_attachment(private.id, bob.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the recipient can download the file"
+        );
+        assert!(
+            db.find_attachment(private.id, eva.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stranger cannot resolve a private attachment"
+        );
 
         db.truncate().await.unwrap();
         db.close().await;

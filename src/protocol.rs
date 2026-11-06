@@ -138,6 +138,21 @@ pub enum ClientMessage {
     Typing { room: String },
 }
 
+/// Файл, прикреплённый к сообщению.
+///
+/// На диск файл сохраняется под UUID сообщения, поэтому здесь только
+/// метаданные, которые нужны интерфейсу для показа и скачивания.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Attachment {
+    pub id: Uuid,
+    /// Исходное имя файла без пути.
+    pub name: String,
+    /// MIME-тип, полученный от браузера.
+    pub mime: String,
+    /// Размер файла в байтах.
+    pub size: i64,
+}
+
 /// Сообщение общего канала: хранится в истории и рассылается всем клиентам.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
@@ -145,8 +160,12 @@ pub struct ChatMessage {
     /// Комната, в которую отправлено сообщение.
     pub room: String,
     pub author: String,
+    /// Текст сообщения; у сообщения только с файлом он пустой.
     pub text: String,
     pub sent_at: DateTime<Utc>,
+    /// Вложение, если сообщение отправлено вместе с файлом.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
 }
 
 /// Личное сообщение: доставляется только отправителю и получателю.
@@ -155,8 +174,12 @@ pub struct DirectMessage {
     pub id: Uuid,
     pub from: String,
     pub to: String,
+    /// Текст сообщения; у сообщения только с файлом он пустой.
     pub text: String,
     pub sent_at: DateTime<Utc>,
+    /// Вложение, если сообщение отправлено вместе с файлом.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
 }
 
 /// Личная переписка, восстановленная из PostgreSQL при входе пользователя.
@@ -304,6 +327,7 @@ mod tests {
                 to: "Боб".to_owned(),
                 text: "привет".to_owned(),
                 sent_at: Utc::now(),
+                attachment: None,
             },
         };
 

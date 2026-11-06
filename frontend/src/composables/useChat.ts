@@ -17,6 +17,9 @@ import type {
 /** Состояние соединения с сервером. */
 export type ConnectionStatus = 'idle' | 'connecting' | 'online' | 'offline'
 
+/** Максимальный размер файла, который клиент отправляет на сервер (должен совпадать с сервером). */
+export const MAX_FILE_BYTES = 10 * 1024 * 1024
+
 /** Ключ в localStorage, где запоминается последнее имя пользователя. */
 export const NAME_STORAGE_KEY = 'rust-chat:name'
 /** Ключ в localStorage, где хранится токен сессии. */
@@ -75,6 +78,7 @@ function toChatItem(message: ChatMessage): ChatItem {
     author: message.author,
     text: message.text,
     sentAt: message.sent_at,
+    attachment: message.attachment,
   }
 }
 
@@ -87,6 +91,7 @@ function toDirectItem(message: DirectMessage): ChatItem {
     recipient: message.to,
     text: message.text,
     sentAt: message.sent_at,
+    attachment: message.attachment,
   }
 }
 
@@ -141,6 +146,14 @@ export function useChat() {
 
   /** Текст последней ошибки, которую нужно показать пользователю. */
   const error = ref('')
+
+  /** Идёт ли загрузка файла на сервер. */
+  const uploading = ref(false)
+
+  /** Готовые blob-ссылки для превью и скачивания: идентификатор сообщения → ссылка. */
+  const attachmentUrls = new Map<string, string>()
+  /** Загрузки, которые уже выполняются, чтобы не качать один файл дважды. */
+  const pendingAttachments = new Map<string, Promise<string>>()
 
   /** Идёт ли запрос на смену пароля. */
   const passwordBusy = ref(false)
@@ -253,6 +266,7 @@ export function useChat() {
     activePeer.value = null
     lastTypingAt = 0
     clearTypingTimers()
+    revokeAttachmentUrls()
   }
 
   /** Удаляет токен и возвращает экран входа. */
@@ -784,6 +798,76 @@ export function useChat() {
     joinedSocket = false
   }
 
+  /** Освобождает blob-ссылки загруженных файлов: они больше не нужны. */
+  function revokeAttachmentUrls() {
+    for (const url of attachmentUrls.values()) {
+      URL.revokeObjectURL(url)
+    }
+    attachmentUrls.clear()
+    pendingAttachments.clear()
+  }
+
+  /**
+   * Готовит blob-ссылку файла сообщения: скачивает байты с авторизацией.
+   *
+   * Адрес `/api/attachments/{id}` требует токен сессии, который нельзя
+   * безопасно вставить в `<img src>`, поэтому файл получает браузер и создаёт
+   * локальную ссылку. Ссылки кэшируются до выхода из аккаунта.
+   */
+  async function loadAttachment(id: string): Promise<string> {
+    const cached = attachmentUrls.get(id)
+    if (cached) {
+      return cached
+    }
+
+    const inflight = pendingAttachments.get(id)
+    if (inflight) {
+      return inflight
+    }
+
+    const currentToken = token.value
+    if (!currentToken) {
+      throw new Error('Требуется вход')
+    }
+
+    const promise = (async () => {
+      const response = await fetch(`/api/attachments/${id}`, {
+        headers: authHeaders(currentToken),
+      })
+      if (!response.ok) {
+        throw new Error('Не удалось загрузить файл')
+      }
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      attachmentUrls.set(id, url)
+      return url
+    })()
+
+    pendingAttachments.set(id, promise)
+    try {
+      return await promise
+    } finally {
+      pendingAttachments.delete(id)
+    }
+  }
+
+  /** Скачивает файл сообщения под исходным именем. */
+  async function downloadAttachment(id: string, name: string): Promise<void> {
+    try {
+      const url = await loadAttachment(id)
+
+      const link = document.createElement('a')
+      link.href = url
+      link.download = name
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : 'Не удалось скачать файл'
+    }
+  }
+
   /** Отправляет сообщение серверу; `false`, если сокет не открыт. */
   function send(message: ClientMessage): boolean {
     const ws = socket.value
@@ -795,8 +879,17 @@ export function useChat() {
     return true
   }
 
-  /** Отправляет публичное сообщение в `# general` или личное открытому собеседнику. */
-  function post(text: string): boolean {
+  /**
+   * Отправляет сообщение: с файлом — через HTTP-загрузку, без него — по WebSocket.
+   *
+   * Файл отправляется в текущую комнату или открытый личный диалог; сам текст
+   * уходит как комментарий к файлу и может быть пустым.
+   */
+  async function post(text: string, file: File | null = null): Promise<boolean> {
+    if (file) {
+      return uploadFile(file, text)
+    }
+
     const trimmed = text.trim()
     if (!trimmed) {
       return false
@@ -808,6 +901,49 @@ export function useChat() {
     }
 
     return send({ type: 'message', text: trimmed })
+  }
+
+  /** Загружает файл на сервер; сообщение создаёт и рассылает сам сервер. */
+  async function uploadFile(file: File, caption: string): Promise<boolean> {
+    const currentToken = token.value
+    const peer = activePeer.value
+    const room = activeRoom.value
+
+    if (!currentToken || (!peer && !room)) {
+      error.value = 'Нет соединения — файл не отправлен'
+      return false
+    }
+
+    if (file.size > MAX_FILE_BYTES) {
+      error.value = 'Файл больше 10 МБ'
+      return false
+    }
+
+    const body = new FormData()
+    body.append('file', file, file.name)
+    if (peer) {
+      body.append('to', peer)
+    } else {
+      body.append('room', room)
+    }
+    if (caption.trim()) {
+      body.append('text', caption.trim())
+    }
+
+    uploading.value = true
+    try {
+      await api<{ id: string }>('/api/upload', {
+        method: 'POST',
+        headers: authHeaders(currentToken),
+        body,
+      })
+      return true
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : 'Не удалось отправить файл'
+      return false
+    } finally {
+      uploading.value = false
+    }
   }
 
   /** Скрывает текущую ошибку. */
@@ -837,6 +973,7 @@ export function useChat() {
     passwordBusy,
     passwordError,
     passwordNotice,
+    uploading,
     connect,
     reconnect,
     leave,
@@ -848,5 +985,7 @@ export function useChat() {
     changePassword,
     clearPasswordStatus,
     dismissError,
+    loadAttachment,
+    downloadAttachment,
   }
 }

@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 argon2 = "0.5"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"

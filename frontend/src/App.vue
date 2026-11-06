@@ -22,6 +22,7 @@ const {
   passwordBusy,
   passwordError,
   passwordNotice,
+  uploading,
   connect,
   reconnect,
   leave,
@@ -33,6 +34,8 @@ const {
   changePassword,
   clearPasswordStatus,
   dismissError,
+  loadAttachment,
+  downloadAttachment,
 } = useChat()
 </script>
 
@@ -65,6 +68,9 @@ const {
         :password-busy="passwordBusy"
         :password-error="passwordError"
         :password-notice="passwordNotice"
+        :uploading="uploading"
+        :load-attachment="loadAttachment"
+        :download-attachment="downloadAttachment"
         @send="post"
         @open-conversation="openConversation"
         @open-room="openRoom"

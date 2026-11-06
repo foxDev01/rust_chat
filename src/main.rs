@@ -10,6 +10,7 @@ mod protocol;
 mod rate_limit;
 mod routes;
 mod state;
+mod uploads;
 mod ws;
 
 use std::{error::Error, net::SocketAddr};
@@ -29,8 +30,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = Config::from_env()?;
     // Подключаемся к PostgreSQL и применяем схему (см. migrations/001_init.sql).
     let db = ChatDb::connect(&config.db_url).await?;
+    // Готовим папку вложений: если её нет, она создаётся.
+    let uploads = uploads::Uploads::prepare(config.upload_dir.clone(), config.max_upload_bytes)
+        .await
+        .map_err(|error| {
+            format!(
+                "Не удалось создать папку вложений {}: {error}",
+                config.upload_dir.display()
+            )
+        })?;
     // Восстанавливаем публичную историю, чтобы перезапуск не терял сообщения.
-    let state = ChatState::persisted(db).await?;
+    let state = ChatState::persisted(db, uploads).await?;
 
     // Собираем маршруты: /ws, /api/* и раздача собранного фронтенда.
     let app = routes::router(state.clone());

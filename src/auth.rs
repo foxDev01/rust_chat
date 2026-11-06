@@ -119,11 +119,13 @@ pub struct AuthResponse {
     pub user: UserView,
 }
 
-/// Ошибка API в едином формате `{ "error": "..." }`.
+/// Ответ с ошибкой API в едином формате `{ "error": "..." }`.
 ///
 /// Для ответов `429` дополнительно выставляется заголовок `Retry-After`,
 /// чтобы клиент знал, через сколько секунд можно повторить запрос.
-pub struct ApiError {
+/// Поля скрыты: другие модули (например, `routes` для загрузки файлов)
+/// строят ответы через `api_error` и возвращают уже готовый тип.
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
     retry_after: Option<u64>,
@@ -243,6 +245,23 @@ pub async fn change_password(
         .map_err(auth_api_error)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Возвращает владельца токена из `Authorization: Bearer ...`.
+///
+/// Общие HTTP-обработчики файлов пользуются ею, чтобы не дублировать проверку
+/// сессии из `me`.
+pub async fn account_from_headers(
+    state: &ChatState,
+    headers: &HeaderMap,
+) -> Result<Account, ApiError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Требуется вход"))?;
+
+    state
+        .authenticate(&token)
+        .await
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Сессия истекла, войдите снова"))
 }
 
 /// Проверяет пароль перед хешированием.
@@ -377,8 +396,8 @@ fn trust_proxy() -> bool {
     })
 }
 
-/// Ответ с ошибкой в едином для API формате.
-fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+/// Ответ с ошибкой в едином для API формате; открыт другим модулям.
+pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     ApiError {
         status,
         message: message.into(),
