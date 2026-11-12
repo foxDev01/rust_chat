@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{broadcast::error::RecvError, mpsc},
+    sync::{broadcast, broadcast::error::RecvError, mpsc},
     time::{self, Duration},
 };
 use tracing::{debug, info, warn};
@@ -40,6 +40,14 @@ const MAX_FRAME_SIZE: usize = 16 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 type SocketSink = SplitSink<WebSocket, Message>;
+
+/// Постоянные данные соединения, которые нужны каждому входящему кадру.
+struct Session<'a> {
+    id: Uuid,
+    account: &'a Account,
+    author: &'a UserName,
+    state: &'a ChatState,
+}
 
 /// Параметры подключения: браузер не умеет задавать заголовки для WebSocket,
 /// поэтому токен сессии передаётся в строке запроса.
@@ -200,10 +208,13 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
     // живёт отдельно, а имя в списке участников показывается один раз.
     let (users, first_window) = state.join(id, &account, &token_hash, inbox).await;
 
-    // Соединение слушает одну комнату; остальные события отфильтровываются,
-    // чтобы клиент не получал чужие сообщения и не тратил на них трафик.
+    // Соединение слушает одну комнату: сообщения и «печатает…» приходят из её
+    // собственного канала, поэтому чужие комнаты не будят это соединение.
     let rooms = state.rooms().await;
     let mut current_room = state.initial_room().await;
+    // Подписываемся до отправки истории, чтобы не потерять сообщение,
+    // опубликованное в этот момент.
+    let mut room_events = state.subscribe_room(&current_room).await;
 
     // Приветствие, публичная история и личные переписки.
     if !send_initial(
@@ -239,6 +250,15 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // первый тик срабатывает сразу
 
+    // Эти данные неизменны на всё время соединения: обработчику кадра
+    // достаточно одной ссылки на них.
+    let session = Session {
+        id,
+        account: &account,
+        author: &name,
+        state: &state,
+    };
+
     loop {
         tokio::select! {
             // Входящий кадр от браузера.
@@ -249,12 +269,10 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
                     Message::Text(text) => {
                         if !handle_text(
                             text.as_str(),
-                            id,
-                            &account,
-                            &name,
-                            &state,
+                            &session,
                             &mut sink,
                             &mut current_room,
+                            &mut room_events,
                         )
                         .await
                         {
@@ -280,21 +298,30 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
                     Message::Ping(_) | Message::Pong(_) => {}
                 }
             }
-            // Событие общей рассылки (сообщения, системные уведомления, список участников).
+            // Событие общей рассылки (системные уведомления, список участников).
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        // Сообщения и «печатает…» относятся к конкретной комнате:
-                        // остальное соединению не нужно.
-                        let Some(event) = event_for_room(event, &current_room) else {
-                            continue;
-                        };
                         if send_json(&mut sink, &event).await.is_err() {
                             break;
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(%id, skipped, "client is too slow, events were skipped");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            // Сообщение или «печатает…» в открытой комнате.
+            event = room_events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if send_json(&mut sink, &event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(%id, skipped, "client is too slow, room events were skipped");
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -341,17 +368,6 @@ async fn handle_socket(socket: WebSocket, state: ChatState, account: Account, to
 
     let _ = sink.close().await;
     debug!(%id, "connection closed");
-}
-
-/// Оставляет событие, только если оно относится к открытой комнате.
-///
-/// Системные уведомления и список участников общие для всех комнат.
-fn event_for_room(event: ServerMessage, room: &str) -> Option<ServerMessage> {
-    match &event {
-        ServerMessage::Message { message } if message.room != room => None,
-        ServerMessage::Typing { room: target, .. } if target != room => None,
-        _ => Some(event),
-    }
 }
 
 /// Отправляет приветствие, историю комнаты и личные переписки.
@@ -426,18 +442,16 @@ async fn send_history(
 /// Возвращает `false`, если соединение нужно закрыть (например, не удалось отправить ответ).
 async fn handle_text(
     raw: &str,
-    id: Uuid,
-    account: &Account,
-    author: &UserName,
-    state: &ChatState,
+    session: &Session<'_>,
     sink: &mut SocketSink,
     current_room: &mut String,
+    room_events: &mut broadcast::Receiver<ServerMessage>,
 ) -> bool {
     // Неизвестный или битый JSON — просто ошибка протокола, соединение не рвём.
     let message = match serde_json::from_str::<ClientMessage>(raw) {
         Ok(message) => message,
         Err(error) => {
-            debug!(%id, %error, "invalid client payload");
+            debug!(id = %session.id, %error, "invalid client payload");
             return send_error(sink, "Некорректный формат сообщения").await;
         }
     };
@@ -452,24 +466,27 @@ async fn handle_text(
             let message = ChatMessage {
                 id: Uuid::new_v4(),
                 room: current_room.clone(),
-                author: author.to_string(),
+                author: session.author.to_string(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
                 attachment: None,
             };
 
-            // Публикация сама сохранит сообщение и разошлёт его всем;
-            // соединения отфильтруют чужие комнаты.
-            state.publish(message, account.id).await;
+            // Публикация сама сохранит сообщение и разошлёт его подписчикам
+            // этой комнаты.
+            session.state.publish(message, session.account.id).await;
             true
         }
         ClientMessage::JoinRoom { room } => {
-            if !state.is_room(&room).await {
+            if !session.state.is_room(&room).await {
                 return send_error(sink, "Такой комнаты нет").await;
             }
 
+            // Сначала подписка, потом история: сообщение, опубликованное между
+            // этими шагами, попадёт в буфер канала и не потеряется.
+            *room_events = session.state.subscribe_room(&room).await;
             *current_room = room;
-            send_history(sink, state, current_room, None).await
+            send_history(sink, session.state, current_room, None).await
         }
         ClientMessage::HistoryBefore { room, before } => {
             // Страница запрашивается только для открытой комнаты: иначе после
@@ -478,17 +495,23 @@ async fn handle_text(
                 return send_error(sink, "Сначала переключитесь в эту комнату").await;
             }
 
-            send_history(sink, state, &room, Some(before)).await
+            send_history(sink, session.state, &room, Some(before)).await
         }
         ClientMessage::Typing { room } => {
             if room != *current_room {
                 return send_error(sink, "Сначала переключитесь в эту комнату").await;
             }
 
-            state.broadcast(ServerMessage::Typing {
-                room,
-                user: author.to_string(),
-            });
+            session
+                .state
+                .broadcast_room(
+                    &room,
+                    ServerMessage::Typing {
+                        room: room.clone(),
+                        user: session.author.to_string(),
+                    },
+                )
+                .await;
             true
         }
         ClientMessage::Direct { to, text } => {
@@ -504,20 +527,20 @@ async fn handle_text(
 
             // Личные сообщения доставляются только тем, кто сейчас онлайн.
             // У получателя может быть открыто несколько окон — доставляем в каждое.
-            let connections = state.connections(recipient.as_str()).await;
+            let connections = session.state.connections(recipient.as_str()).await;
             let Some(recipient_connection) = connections.first() else {
                 return send_error(sink, "Пользователь не в сети").await;
             };
 
             // Идентификатор аккаунта точно отвечает на вопрос «это я сам?»,
             // даже если сравнивать пришлось бы имена в разном регистре.
-            if recipient_connection.account_id == account.id {
+            if recipient_connection.account_id == session.account.id {
                 return send_error(sink, "Нельзя отправить личное сообщение самому себе").await;
             }
 
             let message = DirectMessage {
                 id: Uuid::new_v4(),
-                from: author.to_string(),
+                from: session.author.to_string(),
                 to: recipient_connection.name.clone(),
                 text: text.into_string(),
                 sent_at: Utc::now(),
@@ -526,8 +549,13 @@ async fn handle_text(
 
             // Запись в базу и доставка во все окна обоих участников общие
             // с HTTP-загрузкой файлов.
-            if state
-                .deliver_direct(&message, account.id, recipient_connection.account_id)
+            if session
+                .state
+                .deliver_direct(
+                    &message,
+                    session.account.id,
+                    recipient_connection.account_id,
+                )
                 .await
                 == 0
             {
@@ -544,7 +572,10 @@ async fn handle_text(
                 Err(reason) => return send_error(sink, reason).await,
             };
 
-            state.mark_read(account.id, peer.as_str()).await;
+            session
+                .state
+                .mark_read(session.account.id, peer.as_str())
+                .await;
             true
         }
     }

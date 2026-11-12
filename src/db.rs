@@ -25,6 +25,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Максимальное число соединений в пуле.
 const MAX_CONNECTIONS: u32 = 5;
 
+/// Сериализует интеграционные тесты, которым нужна одна и та же база.
+///
+/// Тесты по умолчанию идут параллельно, а одновременное применение миграций
+/// и `TRUNCATE` в двух потоках мешает друг другу.
+#[cfg(test)]
+pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Сколько последних сообщений одного диалога восстанавливается при входе пользователя.
 pub const THREAD_REPLAY: i64 = 100;
 
@@ -138,6 +145,13 @@ impl ChatDb {
     /// Закрывает все соединения пула.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Сколько соединений пула занято и сколько свободно.
+    ///
+    /// Значения читаются без запроса к базе и подходят для `/api/health`.
+    pub fn pool_stats(&self) -> (u32, u32) {
+        (self.pool.size(), self.pool.num_idle() as u32)
     }
 
     /// Создаёт стартовые комнаты и обновляет их названия и порядок.
@@ -635,7 +649,7 @@ impl ChatDb {
     /// Удаляет все сохранённые сообщения и аккаунты. Используется интеграционным
     /// тестом PostgreSQL.
     #[cfg(test)]
-    async fn truncate(&self) -> Result<(), sqlx::Error> {
+    pub(crate) async fn truncate(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
             "TRUNCATE chat_messages, direct_messages, direct_reads, sessions, accounts
              RESTART IDENTITY",
@@ -686,6 +700,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn round_trips_messages_and_read_marks() {
+        let _guard = DB_TEST_LOCK.lock().await;
         let url = std::env::var("CHAT_DB_URL").expect("CHAT_DB_URL must be set");
         let db = ChatDb::connect(&url).await.expect("connect to PostgreSQL");
         db.truncate().await.expect("truncate");

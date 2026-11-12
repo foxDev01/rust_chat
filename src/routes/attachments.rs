@@ -1,110 +1,34 @@
-//! HTTP-маршруты сервера: WebSocket, служебный API, загрузка и раздача
-//! файлов, а также раздача собранного SPA.
-
-use std::path::PathBuf;
+//! HTTP-обработчики вложений: загрузка файла вместе с сообщением и
+//! авторизованное скачивание.
+//!
+//! Загрузка идёт отдельным HTTP-запросом, потому что WebSocket-кадры
+//! ограничены 16 КиБ. После сохранения файла сообщение создаётся и
+//! рассылается обычным путём (`state.publish` / `state.deliver_direct`),
+//! поэтому клиент получает его как любое другое.
 
 use axum::{
-    Json, Router,
+    Json,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State, multipart::MultipartRejection},
+    extract::{Multipart, Path, State, multipart::MultipartRejection},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     },
     response::Response,
-    routing::{get, post},
 };
 use serde_json::{Value, json};
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth, protocol,
+    auth::{self, ApiError},
+    protocol,
     state::ChatState,
     uploads::{content_disposition, normalize_content_type, sanitize_filename},
-    ws,
 };
 
 /// Запас сверх лимита файла на обвязку multipart-запроса.
-const MULTIPART_OVERHEAD: u64 = 256 * 1024;
-
-/// Собирает корневой роутер приложения.
-///
-/// - `/ws` — WebSocket для чата;
-/// - `/api/*` — служебные HTTP-эндпоинты;
-/// - всё остальное — статика из `frontend/dist` (если она собрана).
-pub fn router(state: ChatState) -> Router {
-    let dist = PathBuf::from("frontend/dist");
-    let index = dist.join("index.html");
-
-    // В продакшене сервер сам раздаёт собранный SPA. Если папки `frontend/dist`
-    // нет (обычная ситуация при разработке), запросы просто получат 404.
-    let static_files = ServeDir::new(dist).not_found_service(ServeFile::new(index));
-
-    Router::new()
-        .nest("/api", api_router(&state))
-        .route("/ws", get(ws::upgrade))
-        .fallback_service(static_files)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
-
-/// Роутер служебного API и аутентификации.
-///
-/// Лимит тела запроса берётся из состояния: широко разрешать нельзя,
-/// иначе в память попадут произвольно большие файлы.
-fn api_router(state: &ChatState) -> Router<ChatState> {
-    // Ограничение тела ставится ровно на маршрут загрузки: rest API больше
-    // пары килобайт не требует.
-    let upload_limit = DefaultBodyLimit::max(
-        usize::try_from(state.max_upload_bytes().saturating_add(MULTIPART_OVERHEAD))
-            .unwrap_or(usize::MAX),
-    );
-
-    Router::new()
-        .route("/health", get(health))
-        .route("/register", post(auth::register))
-        .route("/login", post(auth::login))
-        .route("/me", get(auth::me))
-        .route("/logout", post(auth::logout))
-        .route("/password", post(auth::change_password))
-        .route("/upload", post(upload_attachment).layer(upload_limit))
-        .route("/attachments/{id}", get(download_attachment))
-        .fallback(api_not_found)
-}
-
-/// `GET /api/health` — состояние сервера, число пользователей и счётчики сообщений.
-async fn health(State(state): State<ChatState>) -> Json<Value> {
-    // Показываем, используется ли PostgreSQL или состояние живёт только в памяти.
-    let storage = if state.has_storage() {
-        "postgres"
-    } else {
-        "memory"
-    };
-
-    let mut body = json!({
-        "status": "ok",
-        "users": state.users().await.len(),
-        "storage": storage,
-    });
-
-    // Счётчики строк есть только при подключённой базе.
-    if let Some((public, direct)) = state.storage_counts().await {
-        body["messages"] = json!(public);
-        body["direct_messages"] = json!(direct);
-    }
-
-    Json(body)
-}
-
-/// Ответ на неизвестный маршрут внутри `/api`.
-async fn api_not_found() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
-}
+pub(super) const MULTIPART_OVERHEAD: u64 = 256 * 1024;
 
 /// `POST /api/upload` — сохраняет файл и сразу отправляет сообщение.
 ///
@@ -117,7 +41,7 @@ async fn api_not_found() -> (StatusCode, Json<Value>) {
 /// Должно быть задано ровно одно из `room` и `to`. Сообщение создаётся тем же
 /// способом, что и текстовые: сервер рассылает его по WebSocket, поэтому
 /// клиенту достаточно дождаться обычного события.
-async fn upload_attachment(
+pub(super) async fn upload_attachment(
     State(state): State<ChatState>,
     headers: HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
@@ -309,7 +233,7 @@ async fn upload_attachment(
 ///
 /// Ответ всегда помечается `Content-Disposition: attachment` и `nosniff`,
 /// чтобы браузер не открыл HTML или скрипт напрямую из адресной строки.
-async fn download_attachment(
+pub(super) async fn download_attachment(
     State(state): State<ChatState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
@@ -377,15 +301,12 @@ type MultipartField<'a> = axum::extract::multipart::Field<'a>;
 
 /// Проверяет комментарий к файлу теми же правилами, что и текст сообщений.
 fn protocol_text(raw: &str) -> Result<String, ApiError> {
-    crate::protocol::MessageText::parse(raw)
+    protocol::MessageText::parse(raw)
         .map(|text| text.into_string())
         .map_err(|reason| api_error(StatusCode::BAD_REQUEST, reason))
 }
 
-/// Ошибка API — общий формат `{ "error": "..." }` из модуля `auth`.
-type ApiError = auth::ApiError;
-
-/// Короткий конструктор ошибки.
+/// Короткий конструктор ошибки в общем формате API.
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     auth::api_error(status, message)
 }

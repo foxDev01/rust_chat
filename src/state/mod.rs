@@ -1,39 +1,45 @@
 //! Общее состояние чата: участники онлайн, история и рассылка событий.
 //!
-//! Состояние дешево клонируется: внутри лежит `Arc<Inner>`, поэтому один и тот
-//! же экземпляр используют все WebSocket-соединения и HTTP-обработчики.
+//! Модуль собран из нескольких частей, каждая из которых отвечает за своё:
+//!
+//! - [`presence`] — кто онлайн, окна аккаунтов и личные очереди;
+//! - [`history`] — публичная история комнат и рассылка сообщений;
+//! - [`direct`] — личные переписки и отметки о прочтении.
+//!
+//! Сам `ChatState` остаётся тонким фасадом: состояние дешево клонируется,
+//! внутри лежит `Arc<Inner>`, поэтому один и тот же экземпляр используют все
+//! WebSocket-соединения и HTTP-обработчики.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     net::IpAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::auth::{self, Account, AuthError, AuthSession};
-use crate::db::{ChatDb, StoredAttachment, THREAD_REPLAY};
-use crate::protocol::{
-    ChatMessage, DEFAULT_ROOMS, DirectMessage, DirectThread, Room, ServerMessage, UserName,
-    name_key,
-};
+use crate::db::{ChatDb, StoredAttachment};
+use crate::protocol::{DEFAULT_ROOMS, Room, ServerMessage};
 use crate::rate_limit::{LOGIN_QUOTA, REGISTER_QUOTA, RateLimiter};
 use crate::uploads::Uploads;
 
-/// Сколько последних сообщений комнаты получает новый клиент при подключении.
-pub const HISTORY_LIMIT: usize = 100;
+mod direct;
+mod history;
+mod presence;
 
-/// Сколько сообщений отдаётся за один запрос более старой истории.
-pub const PAGE_LIMIT: i64 = 50;
+pub use self::history::HISTORY_LIMIT;
+#[cfg(test)]
+pub use self::history::PAGE_LIMIT;
+pub use self::presence::PERSONAL_QUEUE;
+
+use self::presence::User;
 
 /// Сколько событий может накопиться у медленного клиента, прежде чем они начнут пропускаться.
 const BROADCAST_CAPACITY: usize = 256;
-
-/// Сколько личных сообщений может ждать получателя, прежде чем доставка не удастся.
-pub const PERSONAL_QUEUE: usize = 64;
 
 /// Общее состояние приложения, которое дешево клонируется.
 #[derive(Clone)]
@@ -42,14 +48,17 @@ pub struct ChatState {
 }
 
 struct Inner {
-    /// Канал широковещательной рассылки: у каждого соединения свой получатель.
+    /// Общие события: системные уведомления и список участников.
     events: broadcast::Sender<ServerMessage>,
+    /// Отдельный канал на каждую комнату: сообщения и «печатает…» получают
+    /// только соединения, открывшие эту комнату.
+    room_events: RwLock<HashMap<String, broadcast::Sender<ServerMessage>>>,
     /// Подключённые пользователи: id соединения → имя и личная очередь.
     users: RwLock<BTreeMap<Uuid, User>>,
     /// Доступные комнаты в порядке отображения.
     rooms: RwLock<Vec<Room>>,
     /// Ограниченная история каждой комнаты (не более [`HISTORY_LIMIT`] сообщений).
-    history: RwLock<HashMap<String, VecDeque<ChatMessage>>>,
+    history: RwLock<HashMap<String, VecDeque<crate::protocol::ChatMessage>>>,
     /// Лимиты попыток входа и регистрации по IP-адресу.
     login_limiter: RateLimiter,
     register_limiter: RateLimiter,
@@ -57,32 +66,8 @@ struct Inner {
     uploads: Uploads,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
     db: Option<ChatDb>,
-}
-
-struct User {
-    /// Аккаунт, которому принадлежит окно. Именно он, а не имя, связывает
-    /// соединение с сохранёнными сообщениями.
-    account_id: Uuid,
-    name: String,
-    /// Хеш токена сессии, по которому открыто это окно.
-    ///
-    /// Нужен, чтобы при смене пароля отключить чужие устройства, но оставить
-    /// окна, работающие с тем же токеном.
-    token_hash: String,
-    /// Личные сообщения кладутся сюда, а не в общий broadcast-канал,
-    /// чтобы их содержимое не уходило другим соединениям.
-    inbox: mpsc::Sender<ServerMessage>,
-}
-
-/// Одно открытое окно пользователя.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Connection {
-    /// Идентификатор WebSocket-соединения.
-    pub id: Uuid,
-    /// Имя аккаунта в написании при регистрации.
-    pub name: String,
-    /// Идентификатор аккаунта: по нему сохраняются сообщения.
-    pub account_id: Uuid,
+    /// Момент запуска: отсчёт uptime для `/api/health`.
+    started_at: Instant,
 }
 
 impl ChatState {
@@ -138,6 +123,7 @@ impl ChatState {
         Self {
             inner: Arc::new(Inner {
                 events,
+                room_events: RwLock::new(HashMap::with_capacity(DEFAULT_ROOMS.len())),
                 users: RwLock::new(BTreeMap::new()),
                 rooms: RwLock::new(rooms),
                 history: RwLock::new(history),
@@ -145,6 +131,7 @@ impl ChatState {
                 register_limiter: RateLimiter::new(REGISTER_QUOTA),
                 uploads,
                 db,
+                started_at: Instant::now(),
             }),
         }
     }
@@ -161,10 +148,20 @@ impl ChatState {
         }
     }
 
+    /// Сколько секунд сервер работает с момента запуска.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.inner.started_at.elapsed().as_secs()
+    }
+
+    /// Занятые и свободные соединения пула; `None`, если базы нет.
+    pub fn pool_stats(&self) -> Option<(u32, u32)> {
+        self.inner.db.as_ref().map(ChatDb::pool_stats)
+    }
+
     /// Регистрирует аккаунт и сразу открывает для него сессию.
     pub async fn register(
         &self,
-        username: &UserName,
+        username: &crate::protocol::UserName,
         password: &str,
     ) -> Result<AuthSession, AuthError> {
         let db = self.inner.db.as_ref().ok_or(AuthError::Unavailable)?;
@@ -191,7 +188,7 @@ impl ChatState {
         // Одинаковый ответ для несуществующего имени и неверного пароля,
         // чтобы нельзя было перебором узнать, какие аккаунты есть.
         let Some((account, hash)) = db
-            .find_account_by_key(&name_key(username))
+            .find_account_by_key(&crate::protocol::name_key(username))
             .await
             .map_err(storage_error)?
         else {
@@ -270,7 +267,7 @@ impl ChatState {
             .ok_or(AuthError::Unauthorized)?;
 
         let Some((_, hash)) = db
-            .find_account_by_key(&name_key(&account.username))
+            .find_account_by_key(&crate::protocol::name_key(&account.username))
             .await
             .map_err(storage_error)?
         else {
@@ -304,131 +301,46 @@ impl ChatState {
         Ok(())
     }
 
-    /// Новый получатель широковещательных событий: у каждого соединения он свой.
+    /// Новый получатель общих событий: у каждого соединения он свой.
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMessage> {
         self.inner.events.subscribe()
     }
 
-    /// Отправляет событие всем подписчикам.
+    /// Отправляет общее событие всем соединениям.
+    ///
+    /// Для сообщений комнат используйте [`ChatState::broadcast_room`]: они не
+    /// должны будить соединения других комнат.
     pub fn broadcast(&self, message: ServerMessage) {
         // Ошибка означает лишь то, что слушателей нет, — это нормально.
         let _ = self.inner.events.send(message);
     }
 
-    /// Регистрирует соединение и возвращает список участников.
+    /// Подписка на события одной комнаты.
     ///
-    /// Один аккаунт может быть открыт в нескольких окнах: каждое соединение
-    /// получает свой id, а в списке участников имя показывается один раз.
-    /// Второй элемент результата — `true`, если это первое соединение имени.
-    pub async fn join(
-        &self,
-        id: Uuid,
-        account: &Account,
-        token_hash: &str,
-        inbox: mpsc::Sender<ServerMessage>,
-    ) -> (Vec<String>, bool) {
-        let mut users = self.inner.users.write().await;
-
-        // Первым считается окно, которое открыло аккаунт впервые: только оно
-        // объявляет вход остальным.
-        let first = !users.values().any(|user| user.account_id == account.id);
-
-        users.insert(
-            id,
-            User {
-                account_id: account.id,
-                name: account.username.clone(),
-                token_hash: token_hash.to_owned(),
-                inbox,
-            },
-        );
-
-        (sorted_names(&users), first)
-    }
-
-    /// Удаляет соединение.
-    ///
-    /// Возвращает имя и признак того, что пользователь остался онлайн
-    /// в другом окне.
-    pub async fn leave(&self, id: Uuid) -> Option<(String, bool)> {
-        let mut users = self.inner.users.write().await;
-        let user = users.remove(&id)?;
-
-        let still_online = users
-            .values()
-            .any(|other| other.account_id == user.account_id);
-
-        Some((user.name, still_online))
-    }
-
-    /// Имена участников онлайн, отсортированные без учёта регистра.
-    ///
-    /// Несколько окон одного аккаунта дают одно имя в списке.
-    pub async fn users(&self) -> Vec<String> {
-        let users = self.inner.users.read().await;
-        sorted_names(&users)
-    }
-
-    /// Все соединения пользователя с указанным именем (без учёта регистра).
-    ///
-    /// Личное сообщение доставляется в каждое открытое окно получателя.
-    pub async fn connections(&self, name: &str) -> Vec<Connection> {
-        let key = name_key(name);
-        let users = self.inner.users.read().await;
-
-        users
-            .iter()
-            .filter(|(_, user)| name_key(&user.name) == key)
-            .map(|(id, user)| Connection {
-                id: *id,
-                name: user.name.clone(),
-                account_id: user.account_id,
-            })
-            .collect()
-    }
-
-    /// Завершает все соединения аккаунта, открытые с других токенов.
-    ///
-    /// Вызывается после смены пароля: окна с тем же токеном остаются в чате,
-    /// а чужие устройства получают `session_ended` и закрывают соединение.
-    pub async fn end_other_sessions(&self, account_id: Uuid, keep_token_hash: &str) {
-        // Собираем отправители под блокировкой, а отправляем уже без неё.
-        let targets: Vec<mpsc::Sender<ServerMessage>> = self
-            .inner
-            .users
-            .read()
-            .await
-            .values()
-            .filter(|user| user.account_id == account_id && user.token_hash != keep_token_hash)
-            .map(|user| user.inbox.clone())
-            .collect();
-
-        for inbox in targets {
-            let message = ServerMessage::SessionEnded {
-                reason: "Пароль изменён на другом устройстве. Войдите снова.".to_owned(),
-            };
-
-            // Не ждём медленного клиента: смена пароля не должна зависать
-            // из-за переполненной очереди чужого соединения.
-            if inbox.try_send(message).is_err() {
-                warn!("failed to end a stale session: client queue is full");
+    /// Канал создаётся при первом обращении, поэтому список комнат и карта
+    /// каналов не могут разойтись.
+    pub async fn subscribe_room(&self, room: &str) -> broadcast::Receiver<ServerMessage> {
+        {
+            let rooms = self.inner.room_events.read().await;
+            if let Some(sender) = rooms.get(room) {
+                return sender.subscribe();
             }
         }
+
+        let mut rooms = self.inner.room_events.write().await;
+        rooms
+            .entry(room.to_owned())
+            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
+            .subscribe()
     }
 
-    /// Доставляет сообщение одному соединению.
-    ///
-    /// Возвращает `false`, если получатель уже отключился или его очередь переполнена.
-    pub async fn send_to(&self, id: Uuid, message: ServerMessage) -> bool {
-        let inbox = {
-            let users = self.inner.users.read().await;
-            match users.get(&id) {
-                Some(user) => user.inbox.clone(),
-                None => return false,
-            }
-        };
-
-        inbox.try_send(message).is_ok()
+    /// Отправляет событие только подписчикам комнаты.
+    pub async fn broadcast_room(&self, room: &str, message: ServerMessage) {
+        let sender = self.inner.room_events.read().await.get(room).cloned();
+        if let Some(sender) = sender {
+            // Ошибка означает лишь то, что комнату никто не слушает.
+            let _ = sender.send(message);
+        }
     }
 
     /// Комнаты в порядке отображения.
@@ -457,202 +369,6 @@ impl ChatState {
             .any(|candidate| candidate.id == room)
     }
 
-    /// Снимок последних сообщений комнаты из памяти.
-    pub async fn history_snapshot(&self, room: &str) -> Vec<ChatMessage> {
-        self.inner
-            .history
-            .read()
-            .await
-            .get(room)
-            .map(|messages| messages.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Последние сообщения комнаты и признак наличия более старых.
-    pub async fn initial_history(&self, room: &str) -> (Vec<ChatMessage>, bool) {
-        if let Some(db) = &self.inner.db {
-            match db.load_public_history(room, HISTORY_LIMIT as i64).await {
-                Ok(page) => return page,
-                Err(error) => {
-                    warn!(%error, %room, "failed to load room history from PostgreSQL");
-                }
-            }
-        }
-
-        // Без базы или при её ошибке отдаём то, что уже есть в памяти.
-        // Признак `has_more` в этом случае неизвестен, поэтому `false`.
-        (self.history_snapshot(room).await, false)
-    }
-
-    /// Порция истории комнаты, которая старше сообщения `before`.
-    ///
-    /// Если сообщение не найдено, возвращается пустая страница: клиент
-    /// перестанет показывать кнопку подгрузки.
-    pub async fn history_page(&self, room: &str, before: Uuid) -> (Vec<ChatMessage>, bool) {
-        if let Some(db) = &self.inner.db {
-            match db.load_public_page(room, Some(before), PAGE_LIMIT).await {
-                Ok(page) => return page,
-                Err(error) => {
-                    warn!(%error, %room, "failed to load a history page from PostgreSQL");
-                }
-            }
-        }
-
-        // Запасной путь для состояния в памяти: ищем сообщение в очереди
-        // и берём до PAGE_LIMIT элементов перед ним.
-        let history = self.inner.history.read().await;
-        let Some(messages) = history.get(room) else {
-            return (Vec::new(), false);
-        };
-        let Some(index) = messages.iter().position(|message| message.id == before) else {
-            return (Vec::new(), false);
-        };
-
-        let start = index.saturating_sub(PAGE_LIMIT as usize);
-        let page = messages.range(start..index).cloned().collect();
-        (page, start > 0)
-    }
-
-    /// Сохраняет сообщение в истории комнаты, пишет его в базу и рассылает.
-    ///
-    /// `author_id` — аккаунт автора: в PostgreSQL сообщение ссылается на него,
-    /// а не на имя.
-    ///
-    /// Блокировка истории удерживается и во время рассылки, чтобы порядок в
-    /// истории совпадал с порядком доставки, даже если пишут несколько клиентов сразу.
-    pub async fn publish(&self, message: ChatMessage, author_id: Uuid) {
-        {
-            let mut history = self.inner.history.write().await;
-            let room = history
-                .entry(message.room.clone())
-                .or_insert_with(|| VecDeque::with_capacity(HISTORY_LIMIT));
-
-            // История ограничена: самое старое сообщение вытесняется.
-            if room.len() == HISTORY_LIMIT {
-                room.pop_front();
-            }
-            room.push_back(message.clone());
-
-            self.broadcast(ServerMessage::Message {
-                message: message.clone(),
-            });
-        }
-
-        // В базу пишем вне блокировки: порядок после перезапуска задаёт `seq`,
-        // а в текущей сессии порядок уже определён выше.
-        if let Some(db) = &self.inner.db
-            && let Err(error) = db.save_public(&message, author_id).await
-        {
-            warn!(%error, "failed to store a public message");
-        }
-    }
-
-    /// Сохраняет личное сообщение до его доставки, чтобы клиент никогда не получил
-    /// то, чего ещё нет в базе.
-    pub async fn save_direct(&self, message: &DirectMessage, sender_id: Uuid, recipient_id: Uuid) {
-        if let Some(db) = &self.inner.db
-            && let Err(error) = db.save_direct(message, sender_id, recipient_id).await
-        {
-            warn!(%error, "failed to store a private message");
-        }
-    }
-
-    /// Сохраняет личное сообщение и кладёт его в очереди всех окон обоих участников.
-    ///
-    /// Соединения ищутся по `account_id`, поэтому имени не нужно совпадать в
-    /// регистре, а копия автора доставляется в каждое его окно. Возвращает,
-    /// сколько окон получателя приняли сообщение: если ноль, получатель уже
-    /// отключился и сообщение стоит считать недоставленным.
-    pub async fn deliver_direct(
-        &self,
-        message: &DirectMessage,
-        sender_id: Uuid,
-        recipient_id: Uuid,
-    ) -> usize {
-        // Сначала запись: восстановленный диалог не должен потерять сообщение,
-        // которое клиент уже получил.
-        self.save_direct(message, sender_id, recipient_id).await;
-
-        let event = ServerMessage::Direct {
-            message: message.clone(),
-        };
-
-        let mut delivered_recipient = 0;
-        for connection in [
-            self.connections_by_account(sender_id).await,
-            self.connections_by_account(recipient_id).await,
-        ]
-        .concat()
-        {
-            if self.send_to(connection.id, event.clone()).await
-                && connection.account_id == recipient_id
-            {
-                delivered_recipient += 1;
-            }
-        }
-
-        delivered_recipient
-    }
-
-    /// Все соединения аккаунта (в отличие от [`ChatState::connections`] — по имени).
-    async fn connections_by_account(&self, account_id: Uuid) -> Vec<Connection> {
-        let users = self.inner.users.read().await;
-
-        users
-            .iter()
-            .filter(|(_, user)| user.account_id == account_id)
-            .map(|(id, user)| Connection {
-                id: *id,
-                name: user.name.clone(),
-                account_id: user.account_id,
-            })
-            .collect()
-    }
-
-    /// Личные переписки аккаунта из базы.
-    ///
-    /// Если собеседник сейчас онлайн, имя приводится к написанию, под которым он вошёл.
-    pub async fn direct_threads(&self, account_id: Uuid) -> Vec<DirectThread> {
-        let Some(db) = &self.inner.db else {
-            return Vec::new();
-        };
-
-        let threads = match db.load_direct_threads(account_id, THREAD_REPLAY).await {
-            Ok(threads) => threads,
-            Err(error) => {
-                warn!(%error, "failed to load private threads");
-                return Vec::new();
-            }
-        };
-
-        let online = self.users().await;
-
-        threads
-            .into_iter()
-            .map(|thread| {
-                let key = name_key(&thread.peer);
-                match online.iter().find(|user| name_key(user) == key) {
-                    Some(canonical) => DirectThread {
-                        peer: canonical.clone(),
-                        ..thread
-                    },
-                    None => thread,
-                }
-            })
-            .collect()
-    }
-
-    /// Запоминает, что аккаунт прочитал всё, что прислал собеседник.
-    pub async fn mark_read(&self, account_id: Uuid, peer: &str) {
-        let peer_key = name_key(peer);
-
-        if let Some(db) = &self.inner.db
-            && let Err(error) = db.mark_read(account_id, &peer_key).await
-        {
-            warn!(%error, "failed to store a read mark");
-        }
-    }
-
     /// Хранилище файлов, прикрепляемых к сообщениям.
     pub fn uploads(&self) -> &Uploads {
         &self.inner.uploads
@@ -661,6 +377,11 @@ impl ChatState {
     /// Максимальный размер одного вложения в байтах.
     pub fn max_upload_bytes(&self) -> u64 {
         self.inner.uploads.max_bytes()
+    }
+
+    /// Суммарный размер файлов в папке вложений.
+    pub async fn uploads_bytes(&self) -> u64 {
+        self.inner.uploads.usage_bytes().await.unwrap_or(0)
     }
 
     /// Метаданные файла сообщения с проверкой доступа аккаунта.
@@ -693,20 +414,13 @@ fn storage_error(error: sqlx::Error) -> AuthError {
     AuthError::Internal(error.to_string())
 }
 
-/// Собирает уникальные имена участников и сортирует их без учёта регистра.
-fn sorted_names(users: &BTreeMap<Uuid, User>) -> Vec<String> {
-    let mut names: Vec<String> = users.values().map(|user| user.name.clone()).collect();
-    names.sort_by_cached_key(|name| name_key(name));
-    names.dedup_by(|first, second| name_key(first) == name_key(second));
-    names
-}
-
 // Тесты работают только с состоянием в памяти и не требуют PostgreSQL.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::DirectMessage;
+    use crate::protocol::{ChatMessage, DirectMessage};
     use chrono::Utc;
+    use tokio::sync::{broadcast::error::TryRecvError, mpsc};
 
     fn account(name: &str) -> Account {
         Account {
@@ -905,6 +619,28 @@ mod tests {
         assert_eq!(state.history_snapshot("general").await[0].text, "в общей");
         assert_eq!(state.history_snapshot("rust").await[0].text, "в Rust");
         assert!(state.history_snapshot("random").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn room_broadcasts_reach_only_that_room() {
+        let state = ChatState::new();
+        let mut general = state.subscribe_room("general").await;
+        let mut rust = state.subscribe_room("rust").await;
+
+        state
+            .publish(message("bot", "только в общую"), Uuid::new_v4())
+            .await;
+
+        // Подписчик общей комнаты получил сообщение.
+        match general.recv().await {
+            Ok(ServerMessage::Message { message }) => {
+                assert_eq!(message.text, "только в общую");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Подписчик Rust не должен просыпаться на чужих сообщениях.
+        assert!(matches!(rust.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]

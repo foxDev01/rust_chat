@@ -518,9 +518,14 @@ export function useChat() {
       case 'message': {
         const room = message.message.room
         const current = roomTimelines.value[room] ?? []
+        const item = toChatItem(message.message)
+        // Сообщение могло уже прийти в истории: не показываем его дважды.
+        if (current.some((existing) => existing.id === item.id)) {
+          break
+        }
         roomTimelines.value = {
           ...roomTimelines.value,
-          [room]: [...current, toChatItem(message.message)],
+          [room]: [...current, item],
         }
         break
       }

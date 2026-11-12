@@ -66,6 +66,24 @@ impl Uploads {
             Err(error) => Err(error),
         }
     }
+
+    /// Суммарный размер всех вложений на диске.
+    ///
+    /// Используется в `/api/health`: запрос редкий, поэтому обход папки
+    /// дешевле, чем отдельный счётчик, который нужно синхронизировать.
+    pub async fn usage_bytes(&self) -> io::Result<u64> {
+        let mut dir = tokio::fs::read_dir(&self.dir).await?;
+        let mut total = 0u64;
+
+        while let Some(entry) = dir.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+
+        Ok(total)
+    }
 }
 
 /// Оставляет от имени файла только безопасную часть.
