@@ -13,7 +13,7 @@ mod state;
 mod uploads;
 mod ws;
 
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, net::SocketAddr, time::Duration};
 
 use tokio::net::TcpListener;
 use tracing::info;
@@ -42,6 +42,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Восстанавливаем публичную историю, чтобы перезапуск не терял сообщения.
     let state = ChatState::persisted(db, uploads).await?;
 
+    // Файлы, оставшиеся от сбоя между записью на диск и сообщением в базе,
+    // удаляются сразу при старте и затем раз в час.
+    let removed = state.cleanup_orphans().await;
+    if removed > 0 {
+        info!(removed, "removed orphaned attachments");
+    }
+    spawn_orphan_cleanup(state.clone());
+
     // Собираем маршруты: /ws, /api/* и раздача собранного фронтенда.
     let app = routes::router(state.clone());
 
@@ -62,6 +70,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     state.close_storage().await;
     info!("server stopped");
     Ok(())
+}
+
+/// Периодически удаляет вложения, на которые больше нет сообщений.
+///
+/// Первая чистка уже выполнена при старте, поэтому первый тик интервала
+/// пропускается: задача ждёт час и повторяет проверку.
+fn spawn_orphan_cleanup(state: ChatState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            let removed = state.cleanup_orphans().await;
+            if removed > 0 {
+                info!(removed, "removed orphaned attachments");
+            }
+        }
+    });
 }
 
 /// Инициализирует `tracing` с фильтром из `RUST_LOG` или разумным значением по умолчанию.

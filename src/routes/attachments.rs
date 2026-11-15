@@ -17,6 +17,7 @@ use axum::{
     response::Response,
 };
 use serde_json::{Value, json};
+use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -47,6 +48,13 @@ pub(super) async fn upload_attachment(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let account = auth::account_from_headers(&state, &headers).await?;
+
+    // Лимит проверяется до разбора формы: иначе поток загрузок от одного
+    // аккаунта занимал бы память ещё до проверки размера.
+    state
+        .check_upload_rate(account.id)
+        .await
+        .map_err(|wait| auth::rate_limited(wait, "загрузки файлов"))?;
 
     let mut multipart = multipart.map_err(|rejection| {
         api_error(
@@ -244,14 +252,14 @@ pub(super) async fn download_attachment(
         return Err(api_error(StatusCode::NOT_FOUND, "Файл не найден"));
     };
 
-    let bytes = match state.uploads().read(id).await {
-        Ok(Some(bytes)) => bytes,
+    let file = match state.uploads().open(id).await {
+        Ok(Some(file)) => file,
         Ok(None) => {
             warn!(message_id = %id, "attachment metadata without a file on disk");
             return Err(api_error(StatusCode::NOT_FOUND, "Файл не найден"));
         }
         Err(error) => {
-            error!(%error, message_id = %id, "failed to read an attachment");
+            error!(%error, message_id = %id, "failed to open an attachment");
             return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Не удалось прочитать файл",
@@ -259,7 +267,9 @@ pub(super) async fn download_attachment(
         }
     };
 
-    let mut response = Response::new(Body::from(bytes));
+    // Файл отдаётся потоком: в памяти держится только текущий буфер, а не
+    // всё вложение целиком, поэтому размер файла не влияет на память сервера.
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
     let headers = response.headers_mut();
 
     // Значения уже проверены при загрузке (см. `normalize_content_type`),

@@ -398,15 +398,13 @@ async fn send_initial(
     // Личные переписки не входят в публичную историю: клиенту нужны
     // они отдельно по собеседникам, со счётчиками непрочитанных.
     let threads = state.direct_threads(account.id).await;
-    if !threads.is_empty()
-        && send_json(sink, &ServerMessage::DirectHistory { threads })
-            .await
-            .is_err()
-    {
-        return false;
+    if threads.is_empty() {
+        return true;
     }
 
-    true
+    send_json(sink, &ServerMessage::DirectHistory { threads })
+        .await
+        .is_ok()
 }
 
 /// Отправляет историю комнаты: последние сообщения или страницу перед `before`.
@@ -471,6 +469,10 @@ async fn handle_text(
                 sent_at: Utc::now(),
                 attachment: None,
             };
+
+            if let Err(wait) = session.state.check_message_rate(session.account.id).await {
+                return send_error(sink, &too_many_messages(wait)).await;
+            }
 
             // Публикация сама сохранит сообщение и разошлёт его подписчикам
             // этой комнаты.
@@ -538,6 +540,10 @@ async fn handle_text(
                 return send_error(sink, "Нельзя отправить личное сообщение самому себе").await;
             }
 
+            if let Err(wait) = session.state.check_message_rate(session.account.id).await {
+                return send_error(sink, &too_many_messages(wait)).await;
+            }
+
             let message = DirectMessage {
                 id: Uuid::new_v4(),
                 from: session.author.to_string(),
@@ -584,6 +590,16 @@ async fn handle_text(
 /// Ответ HTTP 401 в едином для API формате.
 fn unauthorized(message: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::UNAUTHORIZED, Json(json!({ "error": message })))
+}
+
+/// Текст ошибки для превышенного лимита сообщений.
+///
+/// Клиент показывает его в общем поле ошибки, поэтому важно сказать, сколько
+/// ждать: без этого пользователь жмёт «отправить» ещё раз и не понимает, что
+/// делать.
+fn too_many_messages(wait: Duration) -> String {
+    let seconds = wait.as_secs().max(1);
+    format!("Слишком часто. Подождите {seconds} с.")
 }
 
 /// Отправляет клиенту сообщение об ошибке; `false`, если отправка не удалась.

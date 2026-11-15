@@ -154,8 +154,17 @@ export function useChat() {
   /** Имя файла, который сейчас отправляется. */
   const uploadingFile = ref('')
 
-  /** Готовые blob-ссылки для превью и скачивания: идентификатор сообщения → ссылка. */
-  const attachmentUrls = new Map<string, string>()
+  /** Сколько байт вложений держим в памяти: старые ссылки освобождаются. */
+  const ATTACHMENT_CACHE_BYTES = 64 * 1024 * 1024
+  /**
+   * Готовые blob-ссылки для превью и скачивания: идентификатор сообщения → ссылка.
+   *
+   * `Map` хранит порядок вставки, поэтому первая запись — самая старая; при
+   * переполнении кэша она освобождается первой.
+   */
+  const attachmentUrls = new Map<string, { url: string; size: number }>()
+  /** Сколько байт занимают закэшированные файлы прямо сейчас. */
+  let attachmentCacheBytes = 0
   /** Загрузки, которые уже выполняются, чтобы не качать один файл дважды. */
   const pendingAttachments = new Map<string, Promise<string>>()
   /** Ходящая загрузка файла для отмены при выходе из аккаунта. */
@@ -812,11 +821,34 @@ export function useChat() {
 
   /** Освобождает blob-ссылки загруженных файлов: они больше не нужны. */
   function revokeAttachmentUrls() {
-    for (const url of attachmentUrls.values()) {
+    for (const { url } of attachmentUrls.values()) {
       URL.revokeObjectURL(url)
     }
     attachmentUrls.clear()
+    attachmentCacheBytes = 0
     pendingAttachments.clear()
+  }
+
+  /**
+   * Освобождает самые старые blob-ссылки, пока кэш не уложится в лимит.
+   *
+   * Только что загруженный файл не вытесняется, даже если он один больше
+   * лимита: иначе ссылка была бы отозвана до показа и скачивания.
+   */
+  function trimAttachmentCache(keep: string) {
+    while (attachmentCacheBytes > ATTACHMENT_CACHE_BYTES) {
+      const oldest = attachmentUrls.keys().next().value
+      if (oldest === undefined || oldest === keep) {
+        break
+      }
+
+      const entry = attachmentUrls.get(oldest)
+      attachmentUrls.delete(oldest)
+      if (entry) {
+        attachmentCacheBytes -= entry.size
+        URL.revokeObjectURL(entry.url)
+      }
+    }
   }
 
   /**
@@ -824,12 +856,16 @@ export function useChat() {
    *
    * Адрес `/api/attachments/{id}` требует токен сессии, который нельзя
    * безопасно вставить в `<img src>`, поэтому файл получает браузер и создаёт
-   * локальную ссылку. Ссылки кэшируются до выхода из аккаунта.
+   * локальную ссылку. Кэш ограничен по объёму: старые файлы освобождаются,
+   * иначе за долгую сессию память росла бы без предела.
    */
   async function loadAttachment(id: string): Promise<string> {
     const cached = attachmentUrls.get(id)
     if (cached) {
-      return cached
+      // Обращение делает ссылку самой свежей: вытеснят её последней.
+      attachmentUrls.delete(id)
+      attachmentUrls.set(id, cached)
+      return cached.url
     }
 
     const inflight = pendingAttachments.get(id)
@@ -851,8 +887,16 @@ export function useChat() {
       }
 
       const blob = await response.blob()
+      // Пользователь мог выйти, пока файл скачивался: такую ссылку не кэшируем,
+      // иначе blob остался бы в памяти после очистки сессии.
+      if (token.value !== currentToken) {
+        throw new Error('Требуется вход')
+      }
+
       const url = URL.createObjectURL(blob)
-      attachmentUrls.set(id, url)
+      attachmentUrls.set(id, { url, size: blob.size })
+      attachmentCacheBytes += blob.size
+      trimAttachmentCache(id)
       return url
     })()
 

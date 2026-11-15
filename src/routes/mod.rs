@@ -123,10 +123,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{
             Request,
-            header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE},
+            header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, RETRY_AFTER},
         },
     };
     use serde_json::Value;
+    use std::time::{Duration, SystemTime};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -333,7 +334,7 @@ mod tests {
 
         // Несуществующий (или чужой) идентификатор неотличим от запрещённого.
         let response = call(
-            app,
+            app.clone(),
             Request::builder()
                 .uri(format!("/api/attachments/{}", Uuid::new_v4()))
                 .header(AUTHORIZATION, format!("Bearer {}", alice.token))
@@ -343,6 +344,83 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+        // Лимит загрузок: одна загрузка уже прошла, ещё девять укладываются
+        // в десятку за минуту, а одиннадцатая получает `429` и `Retry-After`.
+        for index in 0..9 {
+            let response = call(
+                app.clone(),
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upload")
+                    .header(AUTHORIZATION, format!("Bearer {}", alice.token))
+                    .header(
+                        CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(multipart_body(
+                        boundary,
+                        "general",
+                        &format!("лимит {index}"),
+                        "limit.txt",
+                        contents,
+                    )))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = call(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/upload")
+                .header(AUTHORIZATION, format!("Bearer {}", alice.token))
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_body(
+                    boundary,
+                    "general",
+                    "лимит",
+                    "limit.txt",
+                    contents,
+                )))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+
+        // Файл без сообщения — сирота: чистка удаляет его, но только если он
+        // пролежал дольше запаса, отведённого незавершённой загрузке.
+        let orphan = Uuid::new_v4();
+        let orphan_path = dir.join(orphan.to_string());
+        tokio::fs::write(&orphan_path, b"orphan")
+            .await
+            .expect("write an orphan");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan_path)
+            .expect("open an orphan")
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
+            .expect("age the orphan");
+
+        let fresh = Uuid::new_v4();
+        let fresh_path = dir.join(fresh.to_string());
+        tokio::fs::write(&fresh_path, b"fresh")
+            .await
+            .expect("write a fresh file");
+
+        assert_eq!(state.cleanup_orphans().await, 1);
+        assert!(!orphan_path.exists());
+        // Свежий файл мог ещё не попасть в базу, а файл существующего
+        // сообщения нужен пользователю: оба остаются на месте.
+        assert!(fresh_path.exists());
+        assert!(dir.join(id.to_string()).exists());
+
+        let _ = tokio::fs::remove_file(&fresh_path).await;
         state.close_storage().await;
         let db = ChatDb::connect(&url).await.expect("reconnect for cleanup");
         db.truncate().await.expect("truncate");

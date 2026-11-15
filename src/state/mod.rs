@@ -11,10 +11,10 @@
 //! WebSocket-соединения и HTTP-обработчики.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use tokio::sync::{RwLock, broadcast};
@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::auth::{self, Account, AuthError, AuthSession};
 use crate::db::{ChatDb, StoredAttachment};
 use crate::protocol::{DEFAULT_ROOMS, Room, ServerMessage};
-use crate::rate_limit::{LOGIN_QUOTA, REGISTER_QUOTA, RateLimiter};
-use crate::uploads::Uploads;
+use crate::rate_limit::{LOGIN_QUOTA, MESSAGE_QUOTA, REGISTER_QUOTA, RateLimiter, UPLOAD_QUOTA};
+use crate::uploads::{ORPHAN_GRACE, Uploads};
 
 mod direct;
 mod history;
@@ -62,6 +62,9 @@ struct Inner {
     /// Лимиты попыток входа и регистрации по IP-адресу.
     login_limiter: RateLimiter,
     register_limiter: RateLimiter,
+    /// Лимиты сообщений и загрузок по аккаунту: смена IP не обходит их.
+    message_limiter: RateLimiter<Uuid>,
+    upload_limiter: RateLimiter<Uuid>,
     /// Хранилище файлов, прикрепляемых к сообщениям.
     uploads: Uploads,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
@@ -129,6 +132,8 @@ impl ChatState {
                 history: RwLock::new(history),
                 login_limiter: RateLimiter::new(LOGIN_QUOTA),
                 register_limiter: RateLimiter::new(REGISTER_QUOTA),
+                message_limiter: RateLimiter::new(MESSAGE_QUOTA),
+                upload_limiter: RateLimiter::new(UPLOAD_QUOTA),
                 uploads,
                 db,
                 started_at: Instant::now(),
@@ -219,6 +224,19 @@ impl ChatState {
     /// Проверяет лимит попыток регистрации с указанного IP-адреса.
     pub async fn check_register_rate(&self, ip: IpAddr) -> Result<(), Duration> {
         self.inner.register_limiter.check(ip).await
+    }
+
+    /// Проверяет лимит сообщений аккаунта.
+    ///
+    /// Считается по `account_id`, а не по IP: иначе лимит обходится сменой
+    /// адреса, а несколько окон одного аккаунта должны делить общий бюджет.
+    pub async fn check_message_rate(&self, account_id: Uuid) -> Result<(), Duration> {
+        self.inner.message_limiter.check(account_id).await
+    }
+
+    /// Проверяет лимит загрузок файлов аккаунта.
+    pub async fn check_upload_rate(&self, account_id: Uuid) -> Result<(), Duration> {
+        self.inner.upload_limiter.check(account_id).await
     }
 
     /// Отзывает сессию (выход из аккаунта).
@@ -382,6 +400,59 @@ impl ChatState {
     /// Суммарный размер файлов в папке вложений.
     pub async fn uploads_bytes(&self) -> u64 {
         self.inner.uploads.usage_bytes().await.unwrap_or(0)
+    }
+
+    /// Удаляет файлы, для которых больше нет сообщения в базе.
+    ///
+    /// Возвращает число удалённых файлов. Без базы чистка не делается: иначе
+    /// все файлы выглядели бы сиротами, а тесты работают с состоянием в памяти.
+    /// Свежие файлы не трогаются: загрузка пишет файл раньше сообщения, и
+    /// фоновая чистка не должна отбирать его у незавершённого запроса.
+    pub async fn cleanup_orphans(&self) -> usize {
+        let Some(db) = &self.inner.db else {
+            return 0;
+        };
+
+        let known: HashSet<Uuid> = match db.attachment_ids().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(error) => {
+                warn!(%error, "failed to load attachment ids: cleanup skipped");
+                return 0;
+            }
+        };
+
+        let files = match self.inner.uploads.files().await {
+            Ok(files) => files,
+            Err(error) => {
+                warn!(%error, "failed to list attachment files: cleanup skipped");
+                return 0;
+            }
+        };
+
+        let now = SystemTime::now();
+        let mut removed = 0;
+
+        for (id, modified) in files {
+            if known.contains(&id) {
+                continue;
+            }
+
+            if now.duration_since(modified).unwrap_or_default() < ORPHAN_GRACE {
+                continue;
+            }
+
+            match self.inner.uploads.remove(id).await {
+                Ok(()) => {
+                    removed += 1;
+                    tracing::debug!(message_id = %id, "removed an orphaned attachment");
+                }
+                Err(error) => {
+                    warn!(%error, message_id = %id, "failed to remove an orphaned attachment");
+                }
+            }
+        }
+
+        removed
     }
 
     /// Метаданные файла сообщения с проверкой доступа аккаунта.
@@ -676,5 +747,26 @@ mod tests {
         let (empty, has_more) = state.history_page("general", Uuid::new_v4()).await;
         assert!(empty.is_empty());
         assert!(!has_more);
+    }
+
+    #[tokio::test]
+    async fn enforces_message_rate_per_account() {
+        let state = ChatState::new();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+
+        // Щедрый на вид лимит исчерпывается ровно на одиннадцатом сообщении.
+        for _ in 0..10 {
+            assert!(state.check_message_rate(alice).await.is_ok());
+        }
+
+        let wait = state
+            .check_message_rate(alice)
+            .await
+            .expect_err("лимит должен сработать");
+        assert!(wait.as_secs() <= 10);
+
+        // Второй аккаунт не страдает от сообщений первого.
+        assert!(state.check_message_rate(bob).await.is_ok());
     }
 }

@@ -603,6 +603,23 @@ impl ChatDb {
         Ok(direct.map(|row| stored_attachment_from_row(&row)))
     }
 
+    /// Идентификаторы всех сообщений, у которых есть вложение.
+    ///
+    /// Нужен фоновой чистке: файл на диске, которого нет в этом списке,
+    /// считается осиротевшим. Личные и публичные сообщения объединяются,
+    /// потому что имя файла — UUID сообщения в обеих таблицах.
+    pub async fn attachment_ids(&self) -> Result<Vec<Uuid>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id FROM chat_messages WHERE attachment_name IS NOT NULL
+             UNION ALL
+             SELECT id FROM direct_messages WHERE attachment_name IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(|row| row.get("id")).collect())
+    }
+
     /// Запоминает, что `account_id` прочитал всё, что `peer` отправил к этому моменту.
     ///
     /// Собеседник ищется по ключу имени: клиент знает только имя из списка

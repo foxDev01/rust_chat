@@ -4,14 +4,27 @@
 //! исключает подстановку пути через имя, которое прислал браузер: исходное
 //! имя хранится только в базе и показывается пользователю.
 
-use std::{fmt::Write as _, io, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    io,
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
+use tracing::warn;
 use uuid::Uuid;
 
 /// Сколько символов исходного имени файла сохраняем.
 const MAX_FILENAME_CHARS: usize = 120;
 /// Тип, который используется, если браузер не прислал корректный Content-Type.
 pub const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Минимальный возраст файла, после которого его можно считать сиротой.
+///
+/// Файл записывается на диск раньше, чем появляется строка сообщения в базе.
+/// Без этого запаса фоновая чистка могла бы удалить только что загруженный
+/// файл, который ещё не успел попасть в базу.
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Папка с вложениями и ограничение размера.
 #[derive(Debug, Clone)]
@@ -58,11 +71,57 @@ impl Uploads {
         tokio::fs::write(self.path(id), bytes).await
     }
 
-    /// Читает файл; `None`, если его уже нет.
-    pub async fn read(&self, id: Uuid) -> io::Result<Option<Vec<u8>>> {
-        match tokio::fs::read(self.path(id)).await {
-            Ok(bytes) => Ok(Some(bytes)),
+    /// Открывает файл для потоковой отдачи; `None`, если его уже нет.
+    ///
+    /// Скачивание не читает файл целиком в память: `ReaderStream` отдаёт его
+    /// частями, поэтому размер вложения не влияет на потребление RAM.
+    pub async fn open(&self, id: Uuid) -> io::Result<Option<tokio::fs::File>> {
+        match tokio::fs::File::open(self.path(id)).await {
+            Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Файлы, лежащие в папке: идентификатор сообщения и время изменения.
+    ///
+    /// Имена, которые не являются UUID, пропускаются: сервер сам создаёт только
+    /// такие файлы, а посторонние в папке вложений не должны ломать чистку.
+    pub async fn files(&self) -> io::Result<Vec<(Uuid, SystemTime)>> {
+        let mut dir = tokio::fs::read_dir(&self.dir).await?;
+        let mut files = Vec::new();
+
+        while let Some(entry) = dir.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|name| Uuid::parse_str(name).ok()) else {
+                warn!(
+                    name = %name.to_string_lossy(),
+                    "skipping a file with an unexpected name in the uploads directory"
+                );
+                continue;
+            };
+
+            // Если время изменения недоступно, файл выглядит свежим: лучше
+            // оставить его до следующей чистки, чем удалить используемый.
+            files.push((
+                id,
+                metadata.modified().unwrap_or_else(|_| SystemTime::now()),
+            ));
+        }
+
+        Ok(files)
+    }
+
+    /// Удаляет файл; отсутствие файла ошибкой не считается.
+    pub async fn remove(&self, id: Uuid) -> io::Result<()> {
+        match tokio::fs::remove_file(self.path(id)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -203,5 +262,44 @@ mod tests {
         let value = content_disposition("фото 1.png");
         assert!(value.starts_with("attachment; filename=\"____ 1.png\"; filename*=UTF-8''"));
         assert!(value.contains("%D1%84%D0%BE%D1%82%D0%BE"));
+    }
+
+    #[tokio::test]
+    async fn lists_and_removes_stored_files() {
+        let dir = std::env::temp_dir().join(format!("rust-chat-uploads-{}", Uuid::new_v4()));
+        let uploads = Uploads::prepare(dir.clone(), 1024)
+            .await
+            .expect("prepare uploads");
+        let stored = Uuid::new_v4();
+
+        uploads.save(stored, b"one").await.expect("save");
+        // Посторонний файл не должен притворяться вложением.
+        tokio::fs::write(dir.join("readme.txt"), b"x")
+            .await
+            .expect("write a foreign file");
+
+        let files = uploads.files().await.expect("list files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, stored);
+
+        // Потоковое открытие видит те же байты, что были записаны.
+        let mut file = uploads
+            .open(stored)
+            .await
+            .expect("open")
+            .expect("file exists");
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes)
+            .await
+            .expect("read");
+        assert_eq!(bytes, b"one");
+
+        uploads.remove(stored).await.expect("remove");
+        // Повторное удаление безопасно: файла уже нет.
+        uploads.remove(stored).await.expect("remove twice");
+        assert!(uploads.files().await.expect("list").is_empty());
+        assert!(uploads.open(stored).await.expect("open").is_none());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

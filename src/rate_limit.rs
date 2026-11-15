@@ -1,15 +1,18 @@
 //! Ограничение частоты запросов к чувствительным эндпоинтам.
 //!
-//! Проверка построена на скользящем окне: для каждого ключа (обычно это IP
-//! клиента) хранятся моменты последних попыток. Как только их становится
-//! больше лимита, сервер отвечает `429 Too Many Requests` и просит подождать.
+//! Проверка построена на скользящем окне: для каждого ключа хранятся моменты
+//! последних попыток. Ключ выбирает вызывающая сторона: для входа и
+//! регистрации это IP клиента, для сообщений и загрузок — аккаунт. Как только
+//! попыток становится больше лимита, сервер отвечает `429 Too Many Requests`
+//! (или ошибкой в WebSocket) и просит подождать.
 //!
 //! Ограничение защищает не только от перебора паролей, но и от лишней
-//! нагрузки: Argon2 намеренно медленный, и поток запросов на вход способен
-//! занять все рабочие потоки.
+//! нагрузки: Argon2 намеренно медленный, а поток сообщений или файлов от
+//! одного аккаунта способен занять диск и рабочие потоки.
 
 use std::{
     collections::{HashMap, VecDeque},
+    hash::Hash,
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -37,17 +40,24 @@ impl Quota {
 pub const LOGIN_QUOTA: Quota = Quota::new(10, Duration::from_secs(60));
 /// Регистрация: 5 новых аккаунтов за 10 минут с одного адреса.
 pub const REGISTER_QUOTA: Quota = Quota::new(5, Duration::from_secs(10 * 60));
+/// Сообщения (публичные и личные): 10 за 10 секунд с одного аккаунта.
+pub const MESSAGE_QUOTA: Quota = Quota::new(10, Duration::from_secs(10));
+/// Загрузки файлов: 10 за минуту с одного аккаунта.
+pub const UPLOAD_QUOTA: Quota = Quota::new(10, Duration::from_secs(60));
 
 /// Сколько ключей хранится до принудительной очистки устаревших записей.
 const SWEEP_THRESHOLD: usize = 512;
 
 /// Скользящее окно попыток по ключу.
-pub struct RateLimiter {
+///
+/// По умолчанию ключ — IP-адрес: так устроены лимиты входа и регистрации.
+/// Для лимитов аккаунта используется `RateLimiter<Uuid>`.
+pub struct RateLimiter<K = IpAddr> {
     quota: Quota,
-    buckets: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    buckets: Mutex<HashMap<K, VecDeque<Instant>>>,
 }
 
-impl RateLimiter {
+impl<K: Eq + Hash> RateLimiter<K> {
     /// Создаёт новое независимое ограничение.
     pub fn new(quota: Quota) -> Self {
         Self {
@@ -60,11 +70,11 @@ impl RateLimiter {
     ///
     /// `Ok(())` — попытку можно выполнять. `Err(ожидание)` — лимит исчерпан,
     /// столько времени осталось до освобождения окна.
-    pub async fn check(&self, key: IpAddr) -> Result<(), Duration> {
+    pub async fn check(&self, key: K) -> Result<(), Duration> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().await;
 
-        // Периодически выбрасываем адреса, которые давно не обращались,
+        // Периодически выбрасываем ключи, которые давно не обращались,
         // иначе карта росла бы от разовых посетителей.
         if buckets.len() > SWEEP_THRESHOLD {
             sweep(&mut buckets, self.quota.window, now);
@@ -96,7 +106,11 @@ fn prune(hits: &mut VecDeque<Instant>, window: Duration, now: Instant) {
 }
 
 /// Удаляет пустые и устаревшие записи из всей карты.
-fn sweep(buckets: &mut HashMap<IpAddr, VecDeque<Instant>>, window: Duration, now: Instant) {
+fn sweep<K: Eq + Hash>(
+    buckets: &mut HashMap<K, VecDeque<Instant>>,
+    window: Duration,
+    now: Instant,
+) {
     buckets.retain(|_, hits| {
         prune(hits, window, now);
         !hits.is_empty()
@@ -133,5 +147,18 @@ mod tests {
         assert!(limiter.check(ip(1)).await.is_err());
         // Другой адрес не должен страдать из-за первого.
         assert!(limiter.check(ip(2)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn limits_each_account_separately() {
+        let limiter: RateLimiter<uuid::Uuid> =
+            RateLimiter::new(Quota::new(1, Duration::from_secs(60)));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+
+        assert!(limiter.check(first).await.is_ok());
+        assert!(limiter.check(first).await.is_err());
+        // Второй аккаунт не исчерпал свой лимит чужими сообщениями.
+        assert!(limiter.check(second).await.is_ok());
     }
 }

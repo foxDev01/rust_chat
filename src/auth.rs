@@ -406,11 +406,11 @@ pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiEr
 }
 
 /// Ответ `429 Too Many Requests` с подсказкой, сколько ждать.
-fn rate_limited(wait: Duration, action: &str) -> ApiError {
+pub(crate) fn rate_limited(wait: Duration, action: &str) -> ApiError {
     let seconds = wait.as_secs().max(1);
 
     if seconds > 1 {
-        warn!(seconds, %action, "too many authentication attempts");
+        warn!(seconds, %action, "too many attempts");
     }
 
     ApiError {
