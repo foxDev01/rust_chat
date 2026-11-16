@@ -24,7 +24,9 @@ use uuid::Uuid;
 use crate::auth::{self, Account, AuthError, AuthSession};
 use crate::db::{ChatDb, StoredAttachment};
 use crate::protocol::{DEFAULT_ROOMS, Room, ServerMessage};
-use crate::rate_limit::{LOGIN_QUOTA, MESSAGE_QUOTA, REGISTER_QUOTA, RateLimiter, UPLOAD_QUOTA};
+use crate::rate_limit::{
+    FAILED_LOGIN_QUOTA, LOGIN_QUOTA, MESSAGE_QUOTA, REGISTER_QUOTA, RateLimiter, UPLOAD_QUOTA,
+};
 use crate::uploads::{ORPHAN_GRACE, Uploads};
 
 mod direct;
@@ -65,6 +67,8 @@ struct Inner {
     /// Лимиты сообщений и загрузок по аккаунту: смена IP не обходит их.
     message_limiter: RateLimiter<Uuid>,
     upload_limiter: RateLimiter<Uuid>,
+    /// Неудачные входы по ключу имени: распределённый перебор одного аккаунта.
+    failed_logins: RateLimiter<String>,
     /// Хранилище файлов, прикрепляемых к сообщениям.
     uploads: Uploads,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
@@ -134,6 +138,7 @@ impl ChatState {
                 register_limiter: RateLimiter::new(REGISTER_QUOTA),
                 message_limiter: RateLimiter::new(MESSAGE_QUOTA),
                 upload_limiter: RateLimiter::new(UPLOAD_QUOTA),
+                failed_logins: RateLimiter::new(FAILED_LOGIN_QUOTA),
                 uploads,
                 db,
                 started_at: Instant::now(),
@@ -197,13 +202,18 @@ impl ChatState {
             .await
             .map_err(storage_error)?
         else {
+            self.record_failed_login(username).await;
             return Err(AuthError::InvalidCredentials);
         };
 
         if !auth::verify_password_async(password.to_owned(), hash).await {
+            self.record_failed_login(username).await;
             return Err(AuthError::InvalidCredentials);
         }
 
+        // Успешный вход обнуляет счётчик: опечатки активного пользователя
+        // не должны копиться до блокировки.
+        self.clear_failed_logins(username).await;
         self.open_session(account).await
     }
 
@@ -237,6 +247,29 @@ impl ChatState {
     /// Проверяет лимит загрузок файлов аккаунта.
     pub async fn check_upload_rate(&self, account_id: Uuid) -> Result<(), Duration> {
         self.inner.upload_limiter.check(account_id).await
+    }
+
+    /// Сколько ждать, если по имени уже исчерпан лимит неудачных входов.
+    ///
+    /// Попытку не записывает и вызывается до проверки пароля: заблокированный
+    /// аккаунт не должен тратить время на Argon2.
+    pub async fn login_retry_after(&self, username: &str) -> Option<Duration> {
+        let key = crate::protocol::name_key(username);
+        self.inner.failed_logins.retry_after(&key).await
+    }
+
+    /// Запоминает неудачную попытку входа.
+    async fn record_failed_login(&self, username: &str) {
+        let key = crate::protocol::name_key(username);
+        if self.inner.failed_logins.check(key).await.is_err() {
+            warn!(%username, "too many failed logins for an account");
+        }
+    }
+
+    /// Сбрасывает историю неудачных входов после успешного входа.
+    async fn clear_failed_logins(&self, username: &str) {
+        let key = crate::protocol::name_key(username);
+        self.inner.failed_logins.reset(&key).await;
     }
 
     /// Отзывает сессию (выход из аккаунта).
@@ -768,5 +801,21 @@ mod tests {
 
         // Второй аккаунт не страдает от сообщений первого.
         assert!(state.check_message_rate(bob).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocks_an_account_after_failed_logins() {
+        let state = ChatState::new();
+
+        for _ in 0..FAILED_LOGIN_QUOTA.attempts {
+            state.record_failed_login("Анна").await;
+        }
+
+        // Имя сравнивается без учёта регистра, как и при входе.
+        assert!(state.login_retry_after("анна").await.is_some());
+        assert!(state.login_retry_after("АННА").await.is_some());
+
+        state.clear_failed_logins("анна").await;
+        assert!(state.login_retry_after("Анна").await.is_none());
     }
 }

@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Адрес прослушивания и строка подключения к базе берутся из окружения.
     let config = Config::from_env()?;
     // Подключаемся к PostgreSQL и применяем схему (см. migrations/001_init.sql).
-    let db = ChatDb::connect(&config.db_url).await?;
+    let db = ChatDb::connect_with_pool(&config.db_url, config.db_pool).await?;
     // Готовим папку вложений: если её нет, она создаётся.
     let uploads = uploads::Uploads::prepare(config.upload_dir.clone(), config.max_upload_bytes)
         .await

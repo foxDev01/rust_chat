@@ -2,6 +2,7 @@
 //!
 //! - `CHAT_BIND` — адрес и порт прослушивания (по умолчанию `0.0.0.0:3000`);
 //! - `CHAT_DB_URL` — обязательная строка подключения к PostgreSQL;
+//! - `CHAT_DB_POOL` — максимальное число соединений с базой (по умолчанию 5);
 //! - `CHAT_UPLOAD_DIR` — папка для файлов, прикреплённых к сообщениям;
 //! - `CHAT_MAX_UPLOAD_MB` — максимальный размер одного файла в мегабайтах;
 //! - `CHAT_ALLOWED_ORIGINS`, `CHAT_TRUST_PROXY` читаются модулями `ws` и `auth`.
@@ -16,6 +17,10 @@ pub const DEFAULT_UPLOAD_DIR: &str = "uploads";
 pub const DEFAULT_MAX_UPLOAD_MB: u64 = 10;
 /// Верхняя граница настройки `CHAT_MAX_UPLOAD_MB`: защищает диск от случайной опечатки.
 pub const MAX_UPLOAD_MB_LIMIT: u64 = 100;
+/// Сколько соединений с базой открывается, если `CHAT_DB_POOL` не задан.
+pub const DEFAULT_DB_POOL: u32 = 5;
+/// Верхняя граница пула: PostgreSQL не любит сотни соединений от одного процесса.
+pub const MAX_DB_POOL_LIMIT: u32 = 32;
 
 /// Настройки, необходимые серверу для запуска.
 #[derive(Debug, Clone)]
@@ -24,6 +29,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     /// Строка подключения PostgreSQL: история и личные сообщения хранятся в базе.
     pub db_url: String,
+    /// Максимальное число соединений в пуле.
+    pub db_pool: u32,
     /// Папка, в которой лежат загруженные файлы.
     pub upload_dir: PathBuf,
     /// Максимальный размер одного вложения в байтах.
@@ -53,6 +60,20 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_UPLOAD_DIR));
 
+        // Пул ограничен, чтобы при всплеске активности сервер не открыл
+        // соединений больше, чем разрешает PostgreSQL.
+        let db_pool = match env::var("CHAT_DB_POOL") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("CHAT_DB_POOL должен быть целым числом (получено `{raw}`)"))?,
+            Err(_) => DEFAULT_DB_POOL,
+        };
+
+        if !(1..=MAX_DB_POOL_LIMIT).contains(&db_pool) {
+            return Err(format!("CHAT_DB_POOL должен быть от 1 до {MAX_DB_POOL_LIMIT}").into());
+        }
+
         let max_upload_mb = match env::var("CHAT_MAX_UPLOAD_MB") {
             Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
                 format!("CHAT_MAX_UPLOAD_MB должен быть целым числом (получено `{raw}`)")
@@ -69,6 +90,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             db_url,
+            db_pool,
             upload_dir,
             max_upload_bytes: max_upload_mb * 1024 * 1024,
         })

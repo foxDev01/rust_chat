@@ -183,6 +183,12 @@ pub async fn login(
         .await
         .map_err(|wait| rate_limited(wait, "входа"))?;
 
+    // Второй лимит — по аккаунту: смена IP не помогает перебирать один пароль.
+    // Проверка идёт до Argon2, поэтому заблокированный аккаунт её не тратит.
+    if let Some(wait) = state.login_retry_after(&credentials.username).await {
+        return Err(rate_limited(wait, "входа"));
+    }
+
     let session = state
         .login(&credentials.username, &credentials.password)
         .await

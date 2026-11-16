@@ -44,6 +44,13 @@ pub const REGISTER_QUOTA: Quota = Quota::new(5, Duration::from_secs(10 * 60));
 pub const MESSAGE_QUOTA: Quota = Quota::new(10, Duration::from_secs(10));
 /// Загрузки файлов: 10 за минуту с одного аккаунта.
 pub const UPLOAD_QUOTA: Quota = Quota::new(10, Duration::from_secs(60));
+/// Неудачные входы: 20 за 15 минут на аккаунт.
+///
+/// Считаются только неудачи, поэтому успешный вход сбрасывает счётчик.
+/// Лимит по IP не спасает от распределённого перебора, а этот — спасает
+/// ценой того, что после исчерпания окна вход временно недоступен даже
+/// с верным паролем.
+pub const FAILED_LOGIN_QUOTA: Quota = Quota::new(20, Duration::from_secs(15 * 60));
 
 /// Сколько ключей хранится до принудительной очистки устаревших записей.
 const SWEEP_THRESHOLD: usize = 512;
@@ -92,6 +99,37 @@ impl<K: Eq + Hash> RateLimiter<K> {
 
         hits.push_back(now);
         Ok(())
+    }
+
+    /// Сколько осталось ждать, если ключ уже исчерпал лимит.
+    ///
+    /// В отличие от [`RateLimiter::check`] попытку не записывает: метод нужен,
+    /// чтобы отклонить запрос до дорогой проверки пароля.
+    pub async fn retry_after(&self, key: &K) -> Option<Duration> {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().await;
+        let hits = buckets.get_mut(key)?;
+
+        prune(hits, self.quota.window, now);
+        if hits.len() < self.quota.attempts {
+            return None;
+        }
+
+        let oldest = hits.front().copied().unwrap_or(now);
+        Some(
+            self.quota
+                .window
+                .saturating_sub(now.duration_since(oldest))
+                .max(Duration::from_secs(1)),
+        )
+    }
+
+    /// Сбрасывает историю попыток ключа.
+    ///
+    /// Успешный вход очищает счётчик неудач, чтобы редкие опечатки не
+    /// накапливались у активного пользователя.
+    pub async fn reset(&self, key: &K) {
+        self.buckets.lock().await.remove(key);
     }
 }
 
@@ -160,5 +198,21 @@ mod tests {
         assert!(limiter.check(first).await.is_err());
         // Второй аккаунт не исчерпал свой лимит чужими сообщениями.
         assert!(limiter.check(second).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reports_and_resets_a_blocked_key() {
+        let limiter: RateLimiter<uuid::Uuid> =
+            RateLimiter::new(Quota::new(1, Duration::from_secs(60)));
+        let key = uuid::Uuid::new_v4();
+
+        // Проверка без записи не расходует попытку.
+        assert!(limiter.retry_after(&key).await.is_none());
+        assert!(limiter.check(key).await.is_ok());
+        assert!(limiter.retry_after(&key).await.is_some());
+
+        limiter.reset(&key).await;
+        assert!(limiter.retry_after(&key).await.is_none());
+        assert!(limiter.check(key).await.is_ok());
     }
 }

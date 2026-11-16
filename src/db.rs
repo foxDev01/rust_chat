@@ -22,8 +22,6 @@ use crate::protocol::{
 
 /// Тайм-аут установки соединения с базой.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Максимальное число соединений в пуле.
-const MAX_CONNECTIONS: u32 = 5;
 
 /// Сериализует интеграционные тесты, которым нужна одна и та же база.
 ///
@@ -94,17 +92,28 @@ pub struct ChatDb {
 }
 
 impl ChatDb {
-    /// Подключается к базе и применяет схему чата.
+    /// Подключается к базе с размером пула по умолчанию.
     ///
-    /// Ошибки оборачиваются в понятные сообщения, чтобы при старте было видно,
-    /// что именно пошло не так: строка подключения, доступность сервера или схема.
+    /// Используется тестами; сервер берёт размер пула из `CHAT_DB_POOL`.
+    #[cfg(test)]
     pub async fn connect(url: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::connect_with_pool(url, crate::config::DEFAULT_DB_POOL).await
+    }
+
+    /// Подключается к базе с явно заданным размером пула.
+    ///
+    /// Размер приходит из `CHAT_DB_POOL`: на слабой машине пул уменьшают,
+    /// на активной — увеличивают, не пересобирая сервер.
+    pub async fn connect_with_pool(
+        url: &str,
+        max_connections: u32,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let options: PgConnectOptions = url
             .parse()
             .map_err(|error| format!("CHAT_DB_URL разобран с ошибкой: {error}"))?;
 
         let pool = PgPoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
+            .max_connections(max_connections)
             .acquire_timeout(CONNECT_TIMEOUT)
             .connect_with(options.application_name("rust-chat"))
             .await
