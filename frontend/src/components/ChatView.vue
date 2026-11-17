@@ -127,6 +127,11 @@ const canType = computed(() => {
   return !(props.status === 'online' && isDirect.value && !peerOnline.value)
 })
 
+// Можно ли приложить файл: нужна связь и доступный получатель.
+const canAttach = computed(
+  () => props.status === 'online' && !props.uploading && (!isDirect.value || peerOnline.value),
+)
+
 // Можно ли отправить: есть соединение, получатель доступен, есть текст или файл.
 const canSend = computed(() => {
   if (props.uploading) {
@@ -231,8 +236,8 @@ const placeholder = computed(() => {
 // Подсказка под полем ввода.
 const composerHint = computed(() =>
   isDirect.value
-    ? 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ · видят только вы двое'
-    : 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ',
+    ? 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ (Ctrl+V вставляет из буфера) · видят только вы двое'
+    : 'Enter — отправить, Shift + Enter — новая строка · файлы до 10 МБ (Ctrl+V вставляет из буфера)',
 )
 
 // Что показать, пока в ленте нет сообщений.
@@ -390,21 +395,67 @@ function pickFile() {
   fileInputEl.value?.click()
 }
 
-/** Проверяет выбранный файл: не слишком ли он большой. */
-function onFileChange(event: Event) {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0] ?? null
-
+/** Проверяет размер и запоминает файл: общий путь для выбора и вставки. */
+function setFile(file: File | null) {
   if (file && file.size > MAX_FILE_BYTES) {
     fileError.value = 'Файл больше 10 МБ'
     selectedFile.value = null
-  } else {
-    fileError.value = ''
-    selectedFile.value = file
+    return
   }
+
+  fileError.value = ''
+  selectedFile.value = file
+}
+
+/** Проверяет выбранный файл: не слишком ли он большой. */
+function onFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  setFile(input.files?.[0] ?? null)
 
   // Сброс значения позволяет выбрать тот же файл повторно.
   input.value = ''
+}
+
+/** Файлы из буфера обмена: скриншот, картинка или файл из проводника. */
+function clipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) {
+    return []
+  }
+
+  if (data.files.length > 0) {
+    return [...data.files]
+  }
+
+  return [...data.items]
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null)
+}
+
+/**
+ * Ctrl+V с файлом в буфере прикрепляет его к сообщению.
+ *
+ * Обычный текст не трогаем: без файлов обработчик просто выходит, и браузер
+ * вставляет текст в поле ввода как всегда.
+ */
+function onPaste(event: ClipboardEvent) {
+  const files = clipboardFiles(event.clipboardData)
+  if (files.length === 0) {
+    return
+  }
+
+  // Иначе браузер вставит в textarea имя картинки вместо файла.
+  event.preventDefault()
+
+  if (!canAttach.value) {
+    fileError.value =
+      props.status === 'online'
+        ? `${props.activePeer} не в сети — файл отправить некому`
+        : 'Нет связи — файл можно прикрепить только при подключении'
+    return
+  }
+
+  setFile(files[0])
 }
 
 /** Убирает выбранный файл из поля ввода. */
@@ -741,7 +792,7 @@ onMounted(async () => {
             type="button"
             title="Прикрепить файл"
             aria-label="Прикрепить файл"
-            :disabled="status !== 'online' || uploading || (isDirect && !peerOnline)"
+            :disabled="!canAttach"
             @click="pickFile"
           >
             📎
@@ -763,6 +814,7 @@ onMounted(async () => {
             :disabled="!canType"
             @input="onComposerInput"
             @keydown="onKeydown"
+            @paste="onPaste"
           ></textarea>
 
           <div class="composer-actions">
