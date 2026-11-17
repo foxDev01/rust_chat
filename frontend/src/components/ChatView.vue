@@ -28,6 +28,8 @@ const props = defineProps<{
   uploadProgress: number | null
   /** Имя файла, который отправляется прямо сейчас. */
   uploadingFile: string
+  /** Сколько сообщений ждёт отправки после восстановления связи. */
+  queued: number
   /** Готовит blob-ссылку файла для показа и скачивания. */
   loadAttachment: (id: string) => Promise<string>
   /** Скачивает файл сообщения. */
@@ -117,30 +119,81 @@ const peerOnline = computed(() => {
   return props.users.some((user) => normalize(user) === key)
 })
 
-// Можно ли отправить: есть соединение, получатель доступен, есть текст или файл.
-const canSend = computed(
-  () =>
-    props.status === 'online' &&
-    !props.uploading &&
-    (!isDirect.value || peerOnline.value) &&
-    (draft.value.trim().length > 0 || selectedFile.value !== null),
-)
+// Можно ли набирать текст: без связи сообщение встанет в очередь.
+const canType = computed(() => {
+  if (props.status !== 'online' && props.status !== 'offline') {
+    return false
+  }
+  return !(props.status === 'online' && isDirect.value && !peerOnline.value)
+})
 
-// Подпись на кнопке: текст, файл или загрузка.
+// Можно ли отправить: есть соединение, получатель доступен, есть текст или файл.
+const canSend = computed(() => {
+  if (props.uploading) {
+    return false
+  }
+
+  const hasText = draft.value.trim().length > 0
+  const hasFile = selectedFile.value !== null
+
+  // Без связи в очередь встают только тексты: файл некуда загрузить.
+  if (props.status === 'offline') {
+    return hasText
+  }
+
+  if (props.status !== 'online') {
+    return false
+  }
+
+  return (!isDirect.value || peerOnline.value) && (hasText || hasFile)
+})
+
+// Подпись на кнопке: текст, файл, загрузка или очередь.
 const sendLabel = computed(() => {
   if (props.uploading && selectedFile.value) {
     return 'Загружаем…'
   }
+  if (props.status === 'offline') {
+    return 'В очередь'
+  }
   return selectedFile.value ? 'Отправить файл' : 'Отправить'
+})
+
+/** Склоняет слово «сообщение» под число. */
+function messageWord(count: number): string {
+  const last = count % 10
+  const lastTwo = count % 100
+  if (last === 1 && lastTwo !== 11) {
+    return 'сообщение'
+  }
+  if (last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)) {
+    return 'сообщения'
+  }
+  return 'сообщений'
+}
+
+// «1 сообщение ждёт отправки», «3 сообщения ждут отправки».
+const queuedNote = computed(() => {
+  const count = props.queued
+  if (!count) {
+    return ''
+  }
+  const verb = count % 10 === 1 && count % 100 !== 11 ? 'ждёт' : 'ждут'
+  return `${count} ${messageWord(count)} ${verb} отправки`
 })
 
 // Пояснение над лентой, если что-то мешает общению.
 const connectionNote = computed(() => {
   if (props.status === 'offline') {
-    return 'Соединение потеряно. Проверьте, что сервер запущен, и попробуйте снова.'
+    return queuedNote.value
+      ? `Соединение потеряно. ${queuedNote.value} — отправим после переподключения.`
+      : 'Соединение потеряно. Переподключаемся автоматически…'
   }
   if (props.status === 'connecting') {
     return 'Переподключаемся к серверу…'
+  }
+  if (queuedNote.value) {
+    return `${queuedNote.value} — ждём, когда собеседник появится в сети.`
   }
   if (isDirect.value && !peerOnline.value) {
     return `${props.activePeer} не в сети — сообщение не доставить.`
@@ -160,6 +213,9 @@ const subtitle = computed(() => {
 
 // Текст-заполнитель поля ввода зависит от состояния соединения и диалога.
 const placeholder = computed(() => {
+  if (props.status === 'offline') {
+    return 'Нет связи — сообщение уйдёт после переподключения'
+  }
   if (props.status !== 'online') {
     return 'Нет соединения'
   }
@@ -621,6 +677,13 @@ onMounted(async () => {
           <div v-if="item.kind === 'system'" class="notice" :title="formatTime(item.at)">
             {{ item.text }}
           </div>
+        <!-- Сообщение из очереди: уйдёт само, когда вернётся связь. -->
+        <div v-else-if="item.kind === 'pending'" class="pending-bubble">
+          <p class="pending-bubble__text">{{ item.text }}</p>
+          <span class="pending-bubble__hint" title="Отправится после восстановления связи">
+            ждёт отправки
+          </span>
+        </div>
         <MessageBubble
           v-else
           :message="item"
@@ -697,7 +760,7 @@ onMounted(async () => {
             rows="1"
             maxlength="2000"
             :placeholder="placeholder"
-            :disabled="status !== 'online' || (isDirect && !peerOnline)"
+            :disabled="!canType"
             @input="onComposerInput"
             @keydown="onKeydown"
           ></textarea>

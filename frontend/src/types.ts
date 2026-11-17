@@ -120,8 +120,18 @@ export interface SystemItem {
   at: string
 }
 
+/** Элемент ленты: сообщение, ожидающее отправки после восстановления связи. */
+export interface PendingItem {
+  kind: 'pending'
+  /** Совпадает с записью в очереди клиента: по нему сообщение и убирается. */
+  id: string
+  text: string
+  /** Когда сообщение поставлено в очередь. */
+  at: string
+}
+
 /** Всё, что может отображаться в ленте сообщений. */
-export type TimelineItem = ChatItem | SystemItem
+export type TimelineItem = ChatItem | SystemItem | PendingItem
 
 /** Краткая карточка личного диалога в боковой панели. */
 export interface ConversationSummary {

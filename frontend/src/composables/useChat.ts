@@ -20,6 +20,32 @@ export type ConnectionStatus = 'idle' | 'connecting' | 'online' | 'offline'
 /** Максимальный размер файла, который клиент отправляет на сервер (должен совпадать с сервером). */
 export const MAX_FILE_BYTES = 10 * 1024 * 1024
 
+/** Пауза перед первой попыткой переподключения. */
+const RECONNECT_BASE_MS = 1_000
+/** Предел паузы: при долгом отказе сервера не ждём дольше. */
+const RECONNECT_MAX_MS = 15_000
+/** Сколько сообщений готовы держать в очереди недоставленного. */
+const OUTBOX_LIMIT = 100
+/** Сколько сообщений отправляем за один проход: лимит сервера — 10 за 10 секунд. */
+const FLUSH_BATCH = 8
+/** Пауза перед следующей порцией очереди. */
+const FLUSH_PAUSE_MS = 10_000
+
+/** Сообщение, которое в момент ввода не удалось доставить. */
+interface QueuedMessage {
+  /** Идентификатор элемента ленты, пока сообщение ждёт отправки. */
+  id: string
+  /** Комната или личный диалог. */
+  kind: 'room' | 'direct'
+  /** Комната для `kind === 'room'`. */
+  room: string
+  /** Собеседник для `kind === 'direct'`. */
+  to: string
+  text: string
+  /** Когда сообщение поставлено в очередь. */
+  at: string
+}
+
 /** Ключ в localStorage, где запоминается последнее имя пользователя. */
 export const NAME_STORAGE_KEY = 'rust-chat:name'
 /** Ключ в localStorage, где хранится токен сессии. */
@@ -47,6 +73,22 @@ function authHeaders(token: string): HeadersInit {
   return { Authorization: `Bearer ${token}` }
 }
 
+/**
+ * Ошибка API: понятный пользователю текст и HTTP-статус.
+ *
+ * `status === null` означает, что ответа не было вовсе (сервер или сеть
+ * недоступны). По этому признаку отказ сети отличается от истёкшей сессии.
+ */
+class ApiError extends Error {
+  readonly status: number | null
+
+  constructor(message: string, status: number | null) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 /** Выполняет запрос к API и превращает ошибку сервера в исключение с текстом. */
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response
@@ -54,12 +96,12 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   try {
     response = await fetch(path, init)
   } catch {
-    throw new Error('Не удалось связаться с сервером')
+    throw new ApiError('Не удалось связаться с сервером', null)
   }
 
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { error?: string } | null
-    throw new Error(body?.error ?? `Ошибка сервера (${response.status})`)
+    throw new ApiError(body?.error ?? `Ошибка сервера (${response.status})`, response.status)
   }
 
   // У выхода из аккаунта нет тела ответа.
@@ -108,6 +150,16 @@ function timeValue(value: string): number {
 }
 
 /**
+ * Ответ означает, что сессия действительно больше не действует.
+ *
+ * Всё остальное — недоступный сервер, ошибка прокси или 5xx — временное:
+ * по такой ошибке нельзя выкидывать пользователя на экран входа.
+ */
+function isSessionRejected(cause: unknown): boolean {
+  return cause instanceof ApiError && (cause.status === 401 || cause.status === 403)
+}
+
+/**
  * Состояние чата и все действия с ним.
  *
  * Хук отвечает за вход по аккаунту, хранит одно WebSocket-соединение,
@@ -147,6 +199,11 @@ export function useChat() {
   /** Текст последней ошибки, которую нужно показать пользователю. */
   const error = ref('')
 
+  /** Сообщения, которые уйдут сами, как только вернётся связь. */
+  const outbox = ref<QueuedMessage[]>([])
+  /** Сколько сообщений ждёт отправки: показывается в интерфейсе. */
+  const queued = computed(() => outbox.value.length)
+
   /** Идёт ли загрузка файла на сервер. */
   const uploading = ref(false)
   /** Процент отправки файла: 0–100 или `null` между загрузками. */
@@ -183,10 +240,27 @@ export function useChat() {
   /** Лента текущего экрана: комната или открытый диалог. */
   const activeTimeline = computed<TimelineItem[]>(() => {
     const peer = activePeer.value
-    if (peer) {
-      return directThreads.value[normalizeName(peer)] ?? []
-    }
-    return roomTimelines.value[activeRoom.value] ?? []
+    const key = peer ? normalizeName(peer) : null
+    const base = key
+      ? directThreads.value[key] ?? []
+      : roomTimelines.value[activeRoom.value] ?? []
+
+    // Неотправленные сообщения показываем в той ленте, куда они адресованы:
+    // очередь живёт отдельно и переживает перезагрузку истории.
+    const waiting = outbox.value
+      .filter((entry) =>
+        key
+          ? entry.kind === 'direct' && normalizeName(entry.to) === key
+          : entry.kind === 'room' && entry.room === activeRoom.value,
+      )
+      .map<TimelineItem>((entry) => ({
+        kind: 'pending',
+        id: entry.id,
+        text: entry.text,
+        at: entry.at,
+      }))
+
+    return waiting.length ? [...base, ...waiting] : base
   })
 
   /** Имена участников, которые печатают в открытой комнате. */
@@ -223,8 +297,18 @@ export function useChat() {
 
   /** Счётчик для уникальных id системных уведомлений. */
   let systemSequence = 0
+  /** Счётчик для уникальных id сообщений, ожидающих отправки. */
+  let queuedSequence = 0
   /** Успел ли текущий сокет получить `welcome` (то есть вход состоялся). */
   let joinedSocket = false
+  /** Комната, которую слушает серверное соединение прямо сейчас. */
+  let joinedRoom = ''
+  /** Таймер следующей попытки переподключения. */
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /** Сколько попыток подряд уже провалилось: задаёт паузу. */
+  let reconnectAttempt = 0
+  /** Таймер следующей порции недоставленной очереди. */
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
   /** Таймер «welcome не пришёл»: не даёт интерфейсу навсегда зависнуть в «Подключаемся…». */
   let welcomeTimer: ReturnType<typeof setTimeout> | null = null
   /** Когда в последний раз отправляли `typing`, чтобы не спамить сервер. */
@@ -248,9 +332,57 @@ export function useChat() {
     }
   }
 
+  /** Отменяет запланированное переподключение. */
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+  }
+
+  /** Отменяет следующую порцию очереди. */
+  function clearFlushTimer() {
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+  }
+
+  /** Продолжает отправку очереди, не упираясь в лимит сообщений сервера. */
+  function scheduleFlush() {
+    if (flushTimer !== null || !token.value) {
+      return
+    }
+
+    flushTimer = setTimeout(() => {
+      flushTimer = null
+      flushOutbox(activeRoom.value)
+    }, FLUSH_PAUSE_MS)
+  }
+
+  /**
+   * Планирует переподключение с растущей паузой.
+   *
+   * Пауза удваивается до 15 секунд: короткая быстро возвращает связь после
+   * минутного сбоя, а предел не даёт заваливать лежащий сервер запросами.
+   */
+  function scheduleReconnect() {
+    if (!token.value || reconnectTimer !== null) {
+      return
+    }
+
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempt, RECONNECT_MAX_MS)
+    reconnectAttempt += 1
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      openSocket()
+    }, delay)
+  }
+
   /** Закрывает текущее соединение и снимает обработчики, чтобы `onclose` не сработал. */
   function closeSocket() {
     clearWelcomeTimer()
+    clearReconnectTimer()
     const current = socket.value
     socket.value = null
 
@@ -279,6 +411,9 @@ export function useChat() {
     peerNames.value = {}
     unread.value = {}
     activePeer.value = null
+    // Очередь принадлежит прошлой сессии: чужому аккаунту она не достанется.
+    outbox.value = []
+    joinedRoom = ''
     lastTypingAt = 0
     clearTypingTimers()
     revokeAttachmentUrls()
@@ -287,6 +422,9 @@ export function useChat() {
 
   /** Удаляет токен и возвращает экран входа. */
   function clearSession() {
+    clearReconnectTimer()
+    clearFlushTimer()
+    reconnectAttempt = 0
     token.value = ''
     localStorage.removeItem(TOKEN_STORAGE_KEY)
     resetSession()
@@ -329,7 +467,9 @@ export function useChat() {
     activeRoom.value = room
     lastTypingAt = 0
     // Пока сервер отвечает, показываем закэшированную ленту этой комнаты.
-    send({ type: 'join_room', room })
+    if (send({ type: 'join_room', room })) {
+      joinedRoom = room
+    }
   }
 
   /** Показывает, что участник печатает, и гасит надпись через несколько секунд. */
@@ -448,6 +588,10 @@ export function useChat() {
 
     const item = toDirectItem(message)
     const thread = directThreads.value[key] ?? []
+    // Сервер мог прислать ту же копию повторно: идентификатор уникален.
+    if (thread.some((existing) => existing.id === item.id)) {
+      return
+    }
     directThreads.value = { ...directThreads.value, [key]: [...thread, item] }
 
     const activeKey = activePeer.value ? normalizeName(activePeer.value) : null
@@ -470,11 +614,17 @@ export function useChat() {
   function handle(message: ServerMessage) {
     switch (message.type) {
       // Вход подтверждён: запоминаем имя, комнаты и переходим в онлайн.
-      case 'welcome':
+      case 'welcome': {
+        // После переподключения сервер открывает комнату по умолчанию,
+        // а пользователь ждёт ту, в которой был до обрыва связи.
+        const previousRoom = activeRoom.value
+        const restore = message.rooms.some((room) => room.id === previousRoom)
+
         me.value = message.you
         users.value = message.users
         rooms.value = message.rooms
-        activeRoom.value = message.room
+        activeRoom.value = restore ? previousRoom : message.room
+        joinedRoom = message.room
         roomTimelines.value = {}
         roomHasMore.value = {}
         typing.value = {}
@@ -482,8 +632,14 @@ export function useChat() {
         status.value = 'online'
         error.value = ''
         joinedSocket = true
+        // Связь восстановилась: следующий обрыв снова начнёт с короткой паузы.
+        reconnectAttempt = 0
         localStorage.setItem(NAME_STORAGE_KEY, message.you)
+        // Очередь уходит сразу после приветствия: сервер уже прислал историю,
+        // поэтому собственные сообщения не потеряются и не задвоятся.
+        flushOutbox(activeRoom.value)
         break
+      }
 
       // Пришла история комнаты — заменяем её ленту целиком.
       case 'history':
@@ -579,6 +735,10 @@ export function useChat() {
       // Обновился список участников онлайн.
       case 'users':
         users.value = message.users
+        // Собеседник снова в сети — досылаем ожидающие ему сообщения.
+        if (outbox.value.some((entry) => entry.kind === 'direct')) {
+          flushOutbox(activeRoom.value)
+        }
         break
 
       // Ошибка: если вход не состоялся, откатываем соединение.
@@ -604,6 +764,8 @@ export function useChat() {
 
   /** Открывает WebSocket с текущим токеном сессии. */
   function openSocket() {
+    clearReconnectTimer()
+
     if (!token.value) {
       status.value = 'idle'
       return
@@ -613,6 +775,7 @@ export function useChat() {
     error.value = ''
     status.value = 'connecting'
     joinedSocket = false
+    joinedRoom = ''
     loadingHistory.value = false
     lastTypingAt = 0
 
@@ -652,6 +815,7 @@ export function useChat() {
       clearWelcomeTimer()
       const welcomed = joinedSocket
       joinedSocket = false
+      joinedRoom = ''
 
       if (!welcomed) {
         void verifySession(currentToken)
@@ -659,9 +823,13 @@ export function useChat() {
       }
 
       status.value = me.value ? 'offline' : 'idle'
-      if (!me.value && !error.value) {
+      if (!me.value) {
         error.value = 'Не удалось подключиться к серверу'
+        return
       }
+
+      // Связь пропала посреди сессии: возвращаемся сами, пауза растёт.
+      scheduleReconnect()
     }
 
     // Страховка: если сервер не ответил `welcome` за 10 секунд, выходим из
@@ -682,13 +850,18 @@ export function useChat() {
     try {
       const user = await api<AuthUser>('/api/me', { headers: authHeaders(currentToken) })
 
-      // Сессия жива: скорее всего, аккаунт уже открыт в другом окне.
+      // Сессия жива: сервер или сеть были недоступны, но аккаунт остался.
       me.value = user.username
       status.value = 'offline'
-      if (!error.value) {
-        error.value = 'Соединение потеряно. Попробуйте переподключиться.'
+      scheduleReconnect()
+    } catch (cause) {
+      // Сервер промолчал или ответил 5xx — это не повод терять сессию.
+      if (!isSessionRejected(cause)) {
+        status.value = 'offline'
+        scheduleReconnect()
+        return
       }
-    } catch {
+
       clearSession()
       error.value = 'Сессия истекла, войдите снова'
     }
@@ -744,13 +917,23 @@ export function useChat() {
       localStorage.setItem(NAME_STORAGE_KEY, user.username)
       status.value = 'idle'
       openSocket()
-    } catch {
+    } catch (cause) {
+      // Сервер временно недоступен: токен сохраняем и пробуем снова, иначе
+      // короткий сбой сети выкидывал бы пользователя на экран входа.
+      if (!isSessionRejected(cause)) {
+        status.value = 'offline'
+        scheduleReconnect()
+        return
+      }
+
       clearSession()
     }
   }
 
   /** Переподключается с текущим токеном после потери связи. */
   function reconnect() {
+    // Пользователь не хочет ждать таймер: пробуем прямо сейчас.
+    clearReconnectTimer()
     openSocket()
   }
 
@@ -939,7 +1122,8 @@ export function useChat() {
    * Отправляет сообщение: с файлом — через HTTP-загрузку, без него — по WebSocket.
    *
    * Файл отправляется в текущую комнату или открытый личный диалог; сам текст
-   * уходит как комментарий к файлу и может быть пустым.
+   * уходит как комментарий к файлу и может быть пустым. Если связи нет, текст
+   * встаёт в очередь и уйдёт сам после переподключения.
    */
   async function post(text: string, file: File | null = null): Promise<boolean> {
     if (file) {
@@ -952,11 +1136,124 @@ export function useChat() {
     }
 
     const peer = activePeer.value
-    if (peer) {
-      return send({ type: 'direct', to: peer, text: trimmed })
+    const delivered = peer
+      ? send({ type: 'direct', to: peer, text: trimmed })
+      : send({ type: 'message', text: trimmed })
+
+    if (delivered) {
+      return true
     }
 
-    return send({ type: 'message', text: trimmed })
+    return enqueue(peer, trimmed)
+  }
+
+  /** Кладёт текст в очередь недоставленного; `false`, если очередь не приняла. */
+  function enqueue(peer: string | null, text: string): boolean {
+    if (!token.value) {
+      error.value = 'Требуется вход'
+      return false
+    }
+
+    if (outbox.value.length >= OUTBOX_LIMIT) {
+      error.value = 'Слишком много неотправленных сообщений — дождитесь связи'
+      return false
+    }
+
+    outbox.value = [
+      ...outbox.value,
+      {
+        id: `pending-${++queuedSequence}`,
+        kind: peer ? 'direct' : 'room',
+        room: peer ? '' : activeRoom.value,
+        to: peer ?? '',
+        text,
+        at: new Date().toISOString(),
+      },
+    ]
+
+    return true
+  }
+
+  /**
+   * Отправляет сообщения, накопленные во время потери связи.
+   *
+   * Соединение слушает одну комнату, поэтому очередь группируется по комнатам:
+   * каждой группе предшествует `join_room`. В конце клиент возвращается
+   * в комнату, которую видит пользователь (`desiredRoom`).
+   *
+   * Личные сообщения уходят только тем, кто снова в сети: сервер не хранит
+   * недоставленную личную переписку, и потерять текст было бы хуже, чем
+   * подождать — остальные записи дождутся следующего события `users`.
+   */
+  function flushOutbox(desiredRoom: string | null) {
+    if (status.value !== 'online') {
+      return
+    }
+
+    const queue = outbox.value
+    const sent = new Set<string>()
+    const rooms = new Set(
+      queue.filter((entry) => entry.kind === 'room').map((entry) => entry.room),
+    )
+    // Сервер принимает 10 сообщений за 10 секунд, поэтому за проход отправляем
+    // меньше, а остаток — следующей порцией: иначе часть очереди потерялась бы.
+    let budget = FLUSH_BATCH
+    let deferred = false
+
+    sending: for (const room of rooms) {
+      if (joinedRoom !== room) {
+        if (!send({ type: 'join_room', room })) {
+          break
+        }
+        joinedRoom = room
+      }
+
+      for (const entry of queue) {
+        if (entry.kind !== 'room' || entry.room !== room) {
+          continue
+        }
+        if (budget === 0) {
+          deferred = true
+          break sending
+        }
+        if (!send({ type: 'message', text: entry.text })) {
+          break sending
+        }
+        sent.add(entry.id)
+        budget -= 1
+      }
+    }
+
+    const online = new Set(users.value.map(normalizeName))
+    for (const entry of queue) {
+      if (entry.kind !== 'direct' || !online.has(normalizeName(entry.to))) {
+        continue
+      }
+      if (budget === 0) {
+        deferred = true
+        break
+      }
+      if (!send({ type: 'direct', to: entry.to, text: entry.text })) {
+        break
+      }
+      sent.add(entry.id)
+      budget -= 1
+    }
+
+    if (sent.size > 0) {
+      outbox.value = queue.filter((entry) => !sent.has(entry.id))
+    }
+
+    // Возвращаем соединение туда, что открыто на экране.
+    if (desiredRoom && desiredRoom !== joinedRoom) {
+      if (send({ type: 'join_room', room: desiredRoom })) {
+        joinedRoom = desiredRoom
+      }
+    }
+
+    if (deferred) {
+      scheduleFlush()
+    }
   }
 
   /** Отменяет текущую загрузку файла, если она идёт. */
@@ -1061,8 +1358,16 @@ export function useChat() {
     error.value = ''
   }
 
+  /** Браузер сообщил, что сеть вернулась: не ждём таймер. */
+  function retryAfterNetwork() {
+    if (status.value === 'offline' && token.value) {
+      reconnect()
+    }
+  }
+
   // При загрузке страницы пробуем войти по сохранённому токену.
   onMounted(() => {
+    window.addEventListener('online', retryAfterNetwork)
     void restoreSession()
   })
 
@@ -1080,6 +1385,7 @@ export function useChat() {
     loadingHistory,
     error,
     joined,
+    queued,
     passwordBusy,
     passwordError,
     passwordNotice,

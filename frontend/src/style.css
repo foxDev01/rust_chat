@@ -1065,6 +1065,36 @@ button:disabled {
 /* ---------- Composer ---------- */
 
 /* Строка «печатает…»: высота зарезервирована, чтобы лента не прыгала. */
+/* Сообщение из очереди: видно, что текст сохранён и ждёт связи. */
+.pending-bubble {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  align-self: flex-end;
+  max-width: min(72%, 680px);
+  padding: 10px 14px;
+  border: 1px dashed rgba(255, 154, 112, 0.4);
+  border-radius: 15px 4px 15px 15px;
+  background: rgba(255, 107, 61, 0.06);
+  color: #c6cddd;
+  font-size: 14px;
+  line-height: 1.5;
+  animation: rise 0.2s ease-out both;
+}
+
+.pending-bubble__text {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.pending-bubble__hint {
+  flex: 0 0 auto;
+  color: var(--accent-soft);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
 .typing-indicator {
   min-height: 22px;
   margin: 0;
@@ -1254,23 +1284,6 @@ button:disabled {
 }
 
 /* ---------- Motion ---------- */
-
-.view-enter-active,
-.view-leave-active {
-  transition:
-    opacity 0.18s ease,
-    transform 0.18s ease;
-}
-
-.view-enter-from {
-  opacity: 0;
-  transform: translateY(8px);
-}
-
-.view-leave-to {
-  opacity: 0;
-  transform: translateY(-8px);
-}
 
 @keyframes spin {
   to {

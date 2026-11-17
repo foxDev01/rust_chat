@@ -554,7 +554,9 @@ async fn handle_text(
             };
 
             // Запись в базу и доставка во все окна обоих участников общие
-            // с HTTP-загрузкой файлов.
+            // с HTTP-загрузкой файлов. Копию автору уже положили в его личную
+            // очередь, поэтому отдельная отправка в этот сокет дала бы в ленте
+            // два одинаковых сообщения.
             if session
                 .state
                 .deliver_direct(
@@ -568,9 +570,7 @@ async fn handle_text(
                 return send_error(sink, "Не удалось доставить сообщение").await;
             }
 
-            send_json(sink, &ServerMessage::Direct { message })
-                .await
-                .is_ok()
+            true
         }
         ClientMessage::Read { peer } => {
             let peer = match UserName::parse(&peer) {

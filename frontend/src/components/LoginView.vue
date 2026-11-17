@@ -166,6 +166,9 @@ function submit() {
         </div>
 
         <p v-if="error" class="alert">{{ error }}</p>
+        <p v-else-if="status === 'offline'" class="hint">
+          Сервер недоступен. Переподключаемся автоматически…
+        </p>
 
         <button class="primary-button" type="submit" :disabled="busy">
           <span v-if="busy" class="spinner" aria-hidden="true"></span>
