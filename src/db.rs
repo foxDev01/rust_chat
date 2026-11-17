@@ -91,6 +91,14 @@ pub struct ChatDb {
     pool: PgPool,
 }
 
+/// Описание цели подключения без логина и пароля для текста ошибки.
+fn connection_target(options: &PgConnectOptions) -> String {
+    match options.get_database() {
+        Some(database) => format!("{}:{}/{}", options.get_host(), options.get_port(), database),
+        None => format!("{}:{}", options.get_host(), options.get_port()),
+    }
+}
+
 impl ChatDb {
     /// Подключается к базе с размером пула по умолчанию.
     ///
@@ -112,6 +120,10 @@ impl ChatDb {
             .parse()
             .map_err(|error| format!("CHAT_DB_URL разобран с ошибкой: {error}"))?;
 
+        // В сообщение об ошибке попадают только хост, порт и база: сама строка
+        // подключения содержит пароль и не должна оседать в логах.
+        let target = connection_target(&options);
+
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(CONNECT_TIMEOUT)
@@ -119,7 +131,7 @@ impl ChatDb {
             .await
             .map_err(|error| {
                 format!(
-                    "PostgreSQL недоступен по CHAT_DB_URL ({url}): {error}. \
+                    "PostgreSQL недоступен ({target}): {error}. \
                      Проверьте, что сервер запущен и база создана"
                 )
             })?;
@@ -718,6 +730,19 @@ mod tests {
 
     fn name(value: &str) -> UserName {
         UserName::parse(value).expect("valid test name")
+    }
+
+    #[test]
+    fn connection_target_omits_credentials() {
+        let options: PgConnectOptions = "postgres://user:secret@db.example:5433/chat"
+            .parse()
+            .expect("valid connection string");
+
+        let target = connection_target(&options);
+
+        assert_eq!(target, "db.example:5433/chat");
+        assert!(!target.contains("secret"));
+        assert!(!target.contains("user"));
     }
 
     // Требует запущенного PostgreSQL, например:

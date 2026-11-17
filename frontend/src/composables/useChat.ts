@@ -51,15 +51,15 @@ export const NAME_STORAGE_KEY = 'rust-chat:name'
 /** Ключ в localStorage, где хранится токен сессии. */
 export const TOKEN_STORAGE_KEY = 'rust-chat:token'
 
-/** Адрес WebSocket с токеном сессии в строке запроса. */
-function socketUrl(token: string): string {
+/** Адрес WebSocket с одноразовым билетом в строке запроса. */
+function socketUrl(ticket: string): string {
   const configured = import.meta.env.VITE_WS_URL
   const base =
     configured ??
     `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
 
   const url = new URL(base)
-  url.searchParams.set('token', token)
+  url.searchParams.set('ticket', ticket)
   return url.toString()
 }
 
@@ -71,6 +71,21 @@ function normalizeName(name: string): string {
 /** Заголовок авторизации для HTTP-запросов. */
 function authHeaders(token: string): HeadersInit {
   return { Authorization: `Bearer ${token}` }
+}
+
+/** Ответ `POST /api/ws-ticket`. */
+interface WsTicketResponse {
+  ticket: string
+  expires_in: number
+}
+
+/** Меняет токен сессии на одноразовый билет для WebSocket. */
+async function requestWsTicket(token: string): Promise<string> {
+  const response = await api<WsTicketResponse>('/api/ws-ticket', {
+    method: 'POST',
+    headers: authHeaders(token),
+  })
+  return response.ticket
 }
 
 /**
@@ -315,6 +330,14 @@ export function useChat() {
   let lastTypingAt = 0
   /** Таймеры, которые убирают имя из строки «печатает…». */
   const typingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /**
+   * Номер текущей попытки подключения.
+   *
+   * Билет запрашивается асинхронно, поэтому ответ может прийти уже после
+   * выхода из аккаунта или нового входа: устаревший ответ не должен открывать
+   * сокет. Каждый `closeSocket` увеличивает номер.
+   */
+  let socketGeneration = 0
 
   /** Убирает все таймеры индикатора «печатает…». */
   function clearTypingTimers() {
@@ -375,12 +398,14 @@ export function useChat() {
     reconnectAttempt += 1
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
-      openSocket()
+      void openSocket()
     }, delay)
   }
 
   /** Закрывает текущее соединение и снимает обработчики, чтобы `onclose` не сработал. */
   function closeSocket() {
+    // Незавершённый запрос билета больше не должен открывать сокет.
+    socketGeneration += 1
     clearWelcomeTimer()
     clearReconnectTimer()
     const current = socket.value
@@ -762,8 +787,8 @@ export function useChat() {
     }
   }
 
-  /** Открывает WebSocket с текущим токеном сессии. */
-  function openSocket() {
+  /** Открывает WebSocket: сначала берёт одноразовый билет, затем подключается. */
+  async function openSocket() {
     clearReconnectTimer()
 
     if (!token.value) {
@@ -772,6 +797,7 @@ export function useChat() {
     }
 
     closeSocket()
+    const generation = socketGeneration
     error.value = ''
     status.value = 'connecting'
     joinedSocket = false
@@ -780,7 +806,35 @@ export function useChat() {
     lastTypingAt = 0
 
     const currentToken = token.value
-    const ws = new WebSocket(socketUrl(currentToken))
+
+    let ticket: string
+    try {
+      ticket = await requestWsTicket(currentToken)
+    } catch (cause) {
+      // Пока ждали билет, пользователь мог выйти или начать новый вход.
+      if (generation !== socketGeneration || token.value !== currentToken) {
+        return
+      }
+
+      // Сессия отозвана — на экран входа; сбой сети — повторяем с паузой.
+      if (isSessionRejected(cause)) {
+        clearSession()
+        error.value = 'Сессия истекла, войдите снова'
+        status.value = 'idle'
+        return
+      }
+
+      status.value = 'offline'
+      scheduleReconnect()
+      return
+    }
+
+    // Пока запрос летел, сессия могла смениться: чужой билет не используем.
+    if (generation !== socketGeneration || token.value !== currentToken) {
+      return
+    }
+
+    const ws = new WebSocket(socketUrl(ticket))
     socket.value = ws
 
     ws.onmessage = (event) => {
@@ -894,7 +948,7 @@ export function useChat() {
       localStorage.setItem(TOKEN_STORAGE_KEY, response.token)
       localStorage.setItem(NAME_STORAGE_KEY, response.user.username)
       me.value = response.user.username
-      openSocket()
+      void openSocket()
     } catch (cause) {
       status.value = 'idle'
       error.value = cause instanceof Error ? cause.message : 'Не удалось войти'
@@ -916,7 +970,7 @@ export function useChat() {
       me.value = user.username
       localStorage.setItem(NAME_STORAGE_KEY, user.username)
       status.value = 'idle'
-      openSocket()
+      void openSocket()
     } catch (cause) {
       // Сервер временно недоступен: токен сохраняем и пробуем снова, иначе
       // короткий сбой сети выкидывал бы пользователя на экран входа.
@@ -934,7 +988,7 @@ export function useChat() {
   function reconnect() {
     // Пользователь не хочет ждать таймер: пробуем прямо сейчас.
     clearReconnectTimer()
-    openSocket()
+    void openSocket()
   }
 
   /**

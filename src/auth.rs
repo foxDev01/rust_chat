@@ -28,7 +28,10 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{protocol::UserName, state::ChatState};
+use crate::{
+    protocol::UserName,
+    state::{ChatState, TICKET_TTL},
+};
 
 /// Минимальная длина пароля.
 pub const MIN_PASSWORD_LEN: usize = 8;
@@ -119,6 +122,13 @@ pub struct AuthResponse {
     pub user: UserView,
 }
 
+/// Ответ `POST /api/ws-ticket`: одноразовый билет и его срок в секундах.
+#[derive(Debug, Serialize)]
+pub struct WsTicketResponse {
+    pub ticket: String,
+    pub expires_in: u64,
+}
+
 /// Ответ с ошибкой API в едином формате `{ "error": "..." }`.
 ///
 /// Для ответов `429` дополнительно выставляется заголовок `Retry-After`,
@@ -183,20 +193,56 @@ pub async fn login(
         .await
         .map_err(|wait| rate_limited(wait, "входа"))?;
 
+    // Имя и пароль проверяются до лимита по аккаунту и до базы: иначе строка
+    // на мегабайты становится ключом общего limiter'а и попадает в логи.
+    let username = UserName::parse(&credentials.username).map_err(|_| invalid_credentials())?;
+
+    if credentials.password.chars().count() > MAX_PASSWORD_LEN {
+        return Err(invalid_credentials());
+    }
+
     // Второй лимит — по аккаунту: смена IP не помогает перебирать один пароль.
     // Проверка идёт до Argon2, поэтому заблокированный аккаунт её не тратит.
-    if let Some(wait) = state.login_retry_after(&credentials.username).await {
+    if let Some(wait) = state.login_retry_after(username.as_str()).await {
         return Err(rate_limited(wait, "входа"));
     }
 
     let session = state
-        .login(&credentials.username, &credentials.password)
+        .login(username.as_str(), &credentials.password)
         .await
         .map_err(auth_api_error)?;
 
     Ok(Json(AuthResponse {
         token: session.token,
         user: session.account.into(),
+    }))
+}
+
+/// `POST /api/ws-ticket` — меняет токен сессии на одноразовый билет для WebSocket.
+///
+/// Долгоживущий токен остаётся в заголовке `Authorization`, а в query-строку
+/// сокета попадает только билет на [`TICKET_TTL`], который сгорает при первом
+/// использовании.
+pub async fn ws_ticket(
+    State(state): State<ChatState>,
+    headers: HeaderMap,
+) -> Result<Json<WsTicketResponse>, ApiError> {
+    let token = bearer_token(&headers)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Требуется вход"))?;
+
+    let account = state
+        .authenticate(&token)
+        .await
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "Сессия истекла, войдите снова"))?;
+
+    let ticket = state
+        .issue_ws_ticket(account.id, &token)
+        .await
+        .map_err(|wait| rate_limited(wait, "подключения к чату"))?;
+
+    Ok(Json(WsTicketResponse {
+        ticket,
+        expires_in: TICKET_TTL.as_secs(),
     }))
 }
 
@@ -424,6 +470,14 @@ pub(crate) fn rate_limited(wait: Duration, action: &str) -> ApiError {
         message: format!("Слишком много попыток {action}. Повторите через {seconds} с."),
         retry_after: Some(seconds),
     }
+}
+
+/// Ответ на любую неверную пару «имя/пароль», включая некорректную форму.
+fn invalid_credentials() -> ApiError {
+    api_error(
+        StatusCode::UNAUTHORIZED,
+        AuthError::InvalidCredentials.message(),
+    )
 }
 
 /// Преобразует доменную ошибку в HTTP-ответ.

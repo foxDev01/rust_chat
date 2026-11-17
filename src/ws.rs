@@ -1,4 +1,4 @@
-//! Обработка WebSocket-соединений: вход по токену сессии, сообщения,
+//! Обработка WebSocket-соединений: вход по одноразовому билету, сообщения,
 //! личные переписки и heartbeat.
 
 use std::sync::OnceLock;
@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth::{self, Account},
+    auth::Account,
     protocol::{
         ChatMessage, ClientMessage, DirectMessage, MessageText, Room, ServerMessage, UserName,
     },
@@ -50,18 +50,18 @@ struct Session<'a> {
 }
 
 /// Параметры подключения: браузер не умеет задавать заголовки для WebSocket,
-/// поэтому токен сессии передаётся в строке запроса.
+/// поэтому клиент передаёт одноразовый билет, полученный по HTTP.
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    token: Option<String>,
+    ticket: Option<String>,
 }
 
-/// Точка входа для `GET /ws?token=...`.
+/// Точка входа для `GET /ws?ticket=...`.
 ///
-/// Соединение создаётся только для владельца действующей сессии; иначе
-/// браузер получает обычный HTTP 401 ещё до апгрейда. Запрос с чужого
-/// `Origin` отклоняется с HTTP 403 — так чужой сайт не сможет
-/// подключиться, даже если украдёт токен из `localStorage`.
+/// Соединение создаётся только по действующему билету: он сгорает здесь же,
+/// а сессия, для которой он выдан, проверяется повторно — выход или смена
+/// пароля успевают отозвать её. Запрос с чужого `Origin` отклоняется с HTTP
+/// 403 — так чужой сайт не сможет подключиться, даже если украдёт билет.
 pub async fn upgrade(
     ws: WebSocketUpgrade,
     State(state): State<ChatState>,
@@ -83,16 +83,20 @@ pub async fn upgrade(
         ));
     }
 
-    let token = query
-        .token
+    let ticket = query
+        .ticket
         .ok_or_else(|| unauthorized("Требуется вход в аккаунт"))?;
 
-    let account = state
-        .authenticate(&token)
+    // Билет одноразовый и привязан к хешу сессии: сам токен в сокет не попадает.
+    let token_hash = state
+        .consume_ws_ticket(&ticket)
         .await
         .ok_or_else(|| unauthorized("Сессия истекла, войдите снова"))?;
-    // Хеш нужен, чтобы при смене пароля отличить это окно от чужих устройств.
-    let token_hash = auth::token_hash(&token);
+
+    let account = state
+        .authenticate_hash(&token_hash)
+        .await
+        .ok_or_else(|| unauthorized("Сессия истекла, войдите снова"))?;
 
     Ok(ws
         .max_message_size(MAX_FRAME_SIZE)

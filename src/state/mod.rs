@@ -4,7 +4,8 @@
 //!
 //! - [`presence`] — кто онлайн, окна аккаунтов и личные очереди;
 //! - [`history`] — публичная история комнат и рассылка сообщений;
-//! - [`direct`] — личные переписки и отметки о прочтении.
+//! - [`direct`] — личные переписки и отметки о прочтении;
+//! - [`tickets`] — одноразовые билеты для входа в WebSocket.
 //!
 //! Сам `ChatState` остаётся тонким фасадом: состояние дешево клонируется,
 //! внутри лежит `Arc<Inner>`, поэтому один и тот же экземпляр используют все
@@ -17,7 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -26,19 +27,23 @@ use crate::db::{ChatDb, StoredAttachment};
 use crate::protocol::{DEFAULT_ROOMS, Room, ServerMessage};
 use crate::rate_limit::{
     FAILED_LOGIN_QUOTA, LOGIN_QUOTA, MESSAGE_QUOTA, REGISTER_QUOTA, RateLimiter, UPLOAD_QUOTA,
+    WS_TICKET_QUOTA,
 };
 use crate::uploads::{ORPHAN_GRACE, Uploads};
 
 mod direct;
 mod history;
 mod presence;
+mod tickets;
 
 pub use self::history::HISTORY_LIMIT;
 #[cfg(test)]
 pub use self::history::PAGE_LIMIT;
 pub use self::presence::PERSONAL_QUEUE;
+pub use self::tickets::TICKET_TTL;
 
 use self::presence::User;
+use self::tickets::WsTicket;
 
 /// Сколько событий может накопиться у медленного клиента, прежде чем они начнут пропускаться.
 const BROADCAST_CAPACITY: usize = 256;
@@ -69,6 +74,10 @@ struct Inner {
     upload_limiter: RateLimiter<Uuid>,
     /// Неудачные входы по ключу имени: распределённый перебор одного аккаунта.
     failed_logins: RateLimiter<String>,
+    /// Одноразовые билеты для WebSocket: хеш билета → сессия и срок.
+    ws_tickets: Mutex<HashMap<String, WsTicket>>,
+    /// Лимит выдач билетов на аккаунт.
+    ws_ticket_limiter: RateLimiter<Uuid>,
     /// Хранилище файлов, прикрепляемых к сообщениям.
     uploads: Uploads,
     /// `None` — сервер работает только в памяти, на этом построены тесты.
@@ -139,6 +148,8 @@ impl ChatState {
                 message_limiter: RateLimiter::new(MESSAGE_QUOTA),
                 upload_limiter: RateLimiter::new(UPLOAD_QUOTA),
                 failed_logins: RateLimiter::new(FAILED_LOGIN_QUOTA),
+                ws_tickets: Mutex::new(HashMap::new()),
+                ws_ticket_limiter: RateLimiter::new(WS_TICKET_QUOTA),
                 uploads,
                 db,
                 started_at: Instant::now(),
@@ -219,11 +230,16 @@ impl ChatState {
 
     /// Возвращает аккаунт по токену действующей сессии.
     pub async fn authenticate(&self, token: &str) -> Option<Account> {
+        self.authenticate_hash(&auth::token_hash(token)).await
+    }
+
+    /// То же, но по уже посчитанному SHA-256 токена.
+    ///
+    /// Нужно WebSocket-билету: он хранит хеш сессии, а не сам долгоживущий
+    /// токен, поэтому повторно хешировать нечего.
+    pub async fn authenticate_hash(&self, token_hash: &str) -> Option<Account> {
         let db = self.inner.db.as_ref()?;
-        db.find_account_by_token(&auth::token_hash(token))
-            .await
-            .ok()
-            .flatten()
+        db.find_account_by_token(token_hash).await.ok().flatten()
     }
 
     /// Проверяет лимит попыток входа с указанного IP-адреса.

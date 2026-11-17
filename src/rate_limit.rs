@@ -44,6 +44,11 @@ pub const REGISTER_QUOTA: Quota = Quota::new(5, Duration::from_secs(10 * 60));
 pub const MESSAGE_QUOTA: Quota = Quota::new(10, Duration::from_secs(10));
 /// Загрузки файлов: 10 за минуту с одного аккаунта.
 pub const UPLOAD_QUOTA: Quota = Quota::new(10, Duration::from_secs(60));
+/// Одноразовые билеты для WebSocket: 30 выдач в минуту на аккаунт.
+///
+/// Переподключение с растущей паузой тратит меньше, а лимит не даёт
+/// бесконечно накапливать записи в памяти процесса.
+pub const WS_TICKET_QUOTA: Quota = Quota::new(30, Duration::from_secs(60));
 /// Неудачные входы: 20 за 15 минут на аккаунт.
 ///
 /// Считаются только неудачи, поэтому успешный вход сбрасывает счётчик.

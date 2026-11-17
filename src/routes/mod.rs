@@ -9,16 +9,17 @@ use std::path::PathBuf;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
 use serde_json::{Value, json};
 use tower_http::{
     services::{ServeDir, ServeFile},
-    trace::TraceLayer,
+    trace::{MakeSpan, TraceLayer},
 };
+use tracing::Span;
 
-use crate::state::ChatState;
+use crate::{auth, state::ChatState};
 
 mod attachments;
 
@@ -41,9 +42,31 @@ pub fn router(state: ChatState) -> Router {
         .nest("/api", api_router(&state))
         .route("/ws", get(crate::ws::upgrade))
         .fallback_service(static_files)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                // В `/ws?ticket=...` лежит одноразовый билет, но query-строку
+                // не пишем даже на уровне debug: билет ещё может быть живым.
+                .make_span_with(RequestPathSpan),
+        )
         .with_state(state)
 }
+
+/// Создаёт span запроса из одного пути, без query-строки.
+#[derive(Clone, Copy, Debug)]
+struct RequestPathSpan;
+
+impl<B> MakeSpan<B> for RequestPathSpan {
+    fn make_span(&mut self, request: &Request<B>) -> Span {
+        tracing::debug_span!(
+            "request",
+            method = %request.method(),
+            path = %request.uri().path(),
+        )
+    }
+}
+
+/// Служебные JSON-тела входа и регистрации не бывают больше пары килобайт.
+const AUTH_BODY_LIMIT: usize = 8 * 1024;
 
 /// Роутер служебного API и аутентификации.
 ///
@@ -59,11 +82,21 @@ fn api_router(state: &ChatState) -> Router<ChatState> {
 
     Router::new()
         .route("/health", get(health))
-        .route("/register", post(crate::auth::register))
-        .route("/login", post(crate::auth::login))
+        .route(
+            "/register",
+            post(crate::auth::register).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
+        .route(
+            "/login",
+            post(crate::auth::login).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/me", get(crate::auth::me))
+        .route("/ws-ticket", post(crate::auth::ws_ticket))
         .route("/logout", post(crate::auth::logout))
-        .route("/password", post(crate::auth::change_password))
+        .route(
+            "/password",
+            post(crate::auth::change_password).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/upload", post(upload_attachment).layer(upload_limit))
         .route("/attachments/{id}", get(download_attachment))
         .fallback(api_not_found)
@@ -71,10 +104,14 @@ fn api_router(state: &ChatState) -> Router<ChatState> {
 
 /// `GET /api/health` — состояние сервера, счётчики и занятость ресурсов.
 ///
-/// Эндпоинт не требует входа и не отдаёт содержимое сообщений: только
-/// агрегированные числа, по которым видно, что сервер жив и куда уходит
-/// память/диск.
-async fn health(State(state): State<ChatState>) -> Json<Value> {
+/// Без действующей сессии отдаётся только `status`: число участников, размер
+/// вложений и статистика пула БД — служебные данные, которым не место в
+/// публичном ответе. Подробности доступны с `Authorization: Bearer <token>`.
+async fn health(State(state): State<ChatState>, headers: HeaderMap) -> Json<Value> {
+    if auth::account_from_headers(&state, &headers).await.is_err() {
+        return Json(json!({ "status": "ok" }));
+    }
+
     // Показываем, используется ли PostgreSQL или состояние живёт только в памяти.
     let storage = if state.has_storage() {
         "postgres"
@@ -121,12 +158,14 @@ mod tests {
     };
     use axum::{
         body::{Body, to_bytes},
+        extract::ConnectInfo,
         http::{
             Request,
             header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, RETRY_AFTER},
         },
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use std::net::SocketAddr;
     use std::time::{Duration, SystemTime};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -137,7 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_memory_state() {
+    async fn health_hides_details_without_a_session() {
         let app = router(ChatState::new());
 
         let response = call(
@@ -153,11 +192,14 @@ mod tests {
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
 
+        // Публичный ответ ограничен признаком «сервер жив».
         assert_eq!(payload["status"], "ok");
-        assert_eq!(payload["storage"], "memory");
-        assert_eq!(payload["users"], 0);
-        assert_eq!(payload["windows"], 0);
-        assert!(payload["uptime_seconds"].as_u64().is_some());
+        assert!(payload.get("storage").is_none());
+        assert!(payload.get("users").is_none());
+        assert!(payload.get("windows").is_none());
+        assert!(payload.get("uptime_seconds").is_none());
+        assert!(payload.get("attachments_bytes").is_none());
+        assert!(payload.get("db_pool").is_none());
     }
 
     #[tokio::test]
@@ -179,6 +221,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_ticket_requires_a_session() {
+        let app = router(ChatState::new());
+
+        let response = call(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/ws-ticket")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        // Билет выдаётся только владельцу действующей сессии.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn download_requires_a_session() {
         let app = router(ChatState::new());
         let id = Uuid::new_v4();
@@ -193,6 +253,50 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Собирает POST-запрос с JSON-телом и адресом клиента для `ConnectInfo`.
+    fn json_post(uri: &str, body: String) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
+        request
+    }
+
+    #[tokio::test]
+    async fn login_rejects_malformed_username_without_storage() {
+        let app = router(ChatState::new());
+        let body = json!({
+            "username": "bad\nname",
+            "password": "пароль-123",
+        })
+        .to_string();
+
+        let response = call(app, json_post("/api/login", body)).await;
+
+        // Некорректная форма не доходит ни до базы, ни до общего лимитера.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_oversized_payloads() {
+        let app = router(ChatState::new());
+        let body = json!({
+            "username": "я".repeat(1024 * 1024),
+            "password": "пароль-123",
+        })
+        .to_string();
+
+        let response = call(app, json_post("/api/login", body)).await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
