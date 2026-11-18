@@ -1,0 +1,18 @@
+# Всё, что не нужно отправлять в контекст сборки: уменьшает образ и не
+# сбрасывает кэш слоёв из-за локальных артефактов.
+.git
+.github
+.vscode
+
+target
+frontend/node_modules
+frontend/dist
+frontend/*.local
+uploads
+
+.env
+.env.*
+!.env.example
+
+*.log
+vibe-audit-report.md

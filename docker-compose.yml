@@ -1,0 +1,56 @@
+# Локальный запуск чата вместе с PostgreSQL:
+#
+#   docker compose up --build
+#
+# Сайт — http://localhost:3000. Пароль базы по умолчанию предназначен только
+# для локальной машины: перед публикацией задайте POSTGRES_PASSWORD (или
+# готовую CHAT_DB_URL) в окружении или в файле .env рядом с этим файлом.
+#
+#   docker compose down          # остановить
+#   docker compose down -v       # остановить и удалить базу и вложения
+
+name: rust-chat
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rust_chat
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rust_chat}
+      POSTGRES_DB: rust_chat
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rust_chat -d rust_chat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: rust-chat:local
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Если пароль содержит символы, недопустимые в URL (@, :, /), задайте
+      # CHAT_DB_URL целиком — compose не кодирует значения автоматически.
+      CHAT_DB_URL: ${CHAT_DB_URL:-postgres://rust_chat:${POSTGRES_PASSWORD:-rust_chat}@db:5432/rust_chat}
+      CHAT_BIND: 0.0.0.0:3000
+      CHAT_UPLOAD_DIR: /data/uploads
+      CHAT_DB_POOL: ${CHAT_DB_POOL:-5}
+      CHAT_MAX_UPLOAD_MB: ${CHAT_MAX_UPLOAD_MB:-10}
+      CHAT_ALLOWED_ORIGINS: ${CHAT_ALLOWED_ORIGINS:-}
+      CHAT_TRUST_PROXY: ${CHAT_TRUST_PROXY:-false}
+      RUST_LOG: ${RUST_LOG:-rust_chat=info,tower_http=info}
+    ports:
+      - "${CHAT_PORT:-3000}:3000"
+    volumes:
+      - uploads:/data/uploads
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  pgdata:
+  uploads:
