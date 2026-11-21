@@ -31,6 +31,8 @@ pub const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 pub struct Uploads {
     dir: PathBuf,
     max_bytes: u64,
+    /// Предел суммарного размера папки; 0 — без ограничения.
+    quota_bytes: u64,
 }
 
 impl Default for Uploads {
@@ -41,13 +43,24 @@ impl Default for Uploads {
             PathBuf::from(crate::config::DEFAULT_UPLOAD_DIR),
             crate::config::DEFAULT_MAX_UPLOAD_MB * 1024 * 1024,
         )
+        .with_quota(crate::config::DEFAULT_UPLOAD_QUOTA_MB * 1024 * 1024)
     }
 }
 
 impl Uploads {
     /// Создаёт описание хранилища без обращения к диску.
     pub fn new(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes }
+        Self {
+            dir,
+            max_bytes,
+            quota_bytes: 0,
+        }
+    }
+
+    /// Задаёт общий предел папки в байтах; 0 — без ограничения.
+    pub fn with_quota(mut self, quota_bytes: u64) -> Self {
+        self.quota_bytes = quota_bytes;
+        self
     }
 
     /// Создаёт папку вложений при старте сервера.
@@ -59,6 +72,31 @@ impl Uploads {
     /// Максимальный размер одного файла в байтах.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// Предел суммарного размера папки в байтах; 0 — без ограничения.
+    pub fn quota_bytes(&self) -> u64 {
+        self.quota_bytes
+    }
+
+    /// Поместится ли ещё один файл такого размера.
+    ///
+    /// Размер папки считается обходом каталога: загрузки ограничены по частоте,
+    /// поэтому держать отдельный счётчик ради этого не нужно. Ошибку чтения
+    /// каталога считаем «место есть»: квота не должна ломать загрузку из-за
+    /// временного сбоя файловой системы.
+    pub async fn has_room_for(&self, incoming: u64) -> bool {
+        if self.quota_bytes == 0 {
+            return true;
+        }
+
+        match self.usage_bytes().await {
+            Ok(used) => used.saturating_add(incoming) <= self.quota_bytes,
+            Err(error) => {
+                warn!(%error, "failed to measure the uploads directory");
+                true
+            }
+        }
     }
 
     /// Путь к файлу сообщения.
@@ -128,8 +166,9 @@ impl Uploads {
 
     /// Суммарный размер всех вложений на диске.
     ///
-    /// Используется в `/api/health`: запрос редкий, поэтому обход папки
-    /// дешевле, чем отдельный счётчик, который нужно синхронизировать.
+    /// Используется в `/api/health` и при проверке квоты: запросы редкие,
+    /// поэтому обход папки дешевле, чем отдельный счётчик, который нужно
+    /// синхронизировать с удалением файлов.
     pub async fn usage_bytes(&self) -> io::Result<u64> {
         let mut dir = tokio::fs::read_dir(&self.dir).await?;
         let mut total = 0u64;
@@ -299,6 +338,32 @@ mod tests {
         uploads.remove(stored).await.expect("remove twice");
         assert!(uploads.files().await.expect("list").is_empty());
         assert!(uploads.open(stored).await.expect("open").is_none());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn enforces_the_storage_quota() {
+        let dir = std::env::temp_dir().join(format!("rust-chat-quota-{}", Uuid::new_v4()));
+        let uploads = Uploads::prepare(dir.clone(), 1024)
+            .await
+            .expect("prepare uploads")
+            .with_quota(10);
+
+        // Пустая папка принимает файл в пределах квоты, но не больше неё.
+        assert!(uploads.has_room_for(10).await);
+        assert!(!uploads.has_room_for(11).await);
+
+        uploads.save(Uuid::new_v4(), b"123456").await.expect("save");
+        assert!(uploads.has_room_for(4).await);
+        assert!(!uploads.has_room_for(5).await);
+
+        // Ноль означает «без ограничения»: квота не мешает даже огромным файлам.
+        let unlimited = Uploads::prepare(dir.clone(), 1024)
+            .await
+            .expect("prepare uploads")
+            .with_quota(0);
+        assert!(unlimited.has_room_for(u64::MAX).await);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

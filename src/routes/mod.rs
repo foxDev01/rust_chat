@@ -127,6 +127,7 @@ async fn health(State(state): State<ChatState>, headers: HeaderMap) -> Json<Valu
         "uptime_seconds": state.uptime_seconds(),
         "storage": storage,
         "attachments_bytes": state.uploads_bytes().await,
+        "attachments_quota_bytes": state.uploads().quota_bytes(),
     });
 
     // Счётчики строк есть только при подключённой базе.

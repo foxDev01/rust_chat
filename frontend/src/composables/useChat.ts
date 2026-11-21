@@ -1383,7 +1383,14 @@ export function useChat() {
             return
           }
 
-          const body = (JSON.parse(xhr.responseText) as { error?: string } | null) ?? null
+          // Прокси и балансировщик могут ответить HTML-страницей вместо JSON:
+          // такой ответ не должен оставлять загрузку в вечном «Загружаем…».
+          let body: { error?: string } | null = null
+          try {
+            body = JSON.parse(xhr.responseText) as { error?: string } | null
+          } catch {
+            body = null
+          }
           reject(new Error(body?.error ?? `Ошибка сервера (${xhr.status})`))
         }
 

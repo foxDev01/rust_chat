@@ -124,6 +124,19 @@ pub(super) async fn upload_attachment(
         return Err(api_error(StatusCode::BAD_REQUEST, "Файл не выбран"));
     };
 
+    // Квота папки общая для всех: файлы удаляются только вместе с чисткой
+    // сирот, поэтому без предела каталог однажды займёт весь раздел.
+    if !state.uploads().has_room_for(bytes.len() as u64).await {
+        warn!(
+            size = bytes.len(),
+            "upload rejected: storage quota exceeded"
+        );
+        return Err(api_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "На сервере закончилось место для файлов",
+        ));
+    }
+
     // Сообщение может быть и без комментария: файл сам по себе — это сообщение.
     let caption = if caption.trim().is_empty() {
         String::new()

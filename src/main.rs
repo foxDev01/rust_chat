@@ -38,7 +38,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 "Не удалось создать папку вложений {}: {error}",
                 config.upload_dir.display()
             )
-        })?;
+        })?
+        .with_quota(config.upload_quota_bytes);
     // Восстанавливаем публичную историю, чтобы перезапуск не терял сообщения.
     let state = ChatState::persisted(db, uploads).await?;
 

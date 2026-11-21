@@ -5,6 +5,7 @@
 //! - `CHAT_DB_POOL` — максимальное число соединений с базой (по умолчанию 5);
 //! - `CHAT_UPLOAD_DIR` — папка для файлов, прикреплённых к сообщениям;
 //! - `CHAT_MAX_UPLOAD_MB` — максимальный размер одного файла в мегабайтах;
+//! - `CHAT_UPLOAD_QUOTA_MB` — общий предел папки вложений (0 — без ограничения);
 //! - `CHAT_ALLOWED_ORIGINS`, `CHAT_TRUST_PROXY` читаются модулями `ws` и `auth`.
 
 use std::{env, error::Error, net::SocketAddr, path::PathBuf};
@@ -17,6 +18,10 @@ pub const DEFAULT_UPLOAD_DIR: &str = "uploads";
 pub const DEFAULT_MAX_UPLOAD_MB: u64 = 10;
 /// Верхняя граница настройки `CHAT_MAX_UPLOAD_MB`: защищает диск от случайной опечатки.
 pub const MAX_UPLOAD_MB_LIMIT: u64 = 100;
+/// Общий предел папки вложений по умолчанию — 1 ГиБ.
+pub const DEFAULT_UPLOAD_QUOTA_MB: u64 = 1024;
+/// Верхняя граница `CHAT_UPLOAD_QUOTA_MB` — 1 ТиБ.
+pub const MAX_UPLOAD_QUOTA_MB: u64 = 1024 * 1024;
 /// Сколько соединений с базой открывается, если `CHAT_DB_POOL` не задан.
 pub const DEFAULT_DB_POOL: u32 = 5;
 /// Верхняя граница пула: PostgreSQL не любит сотни соединений от одного процесса.
@@ -35,6 +40,8 @@ pub struct Config {
     pub upload_dir: PathBuf,
     /// Максимальный размер одного вложения в байтах.
     pub max_upload_bytes: u64,
+    /// Предел суммарного размера вложений в байтах; 0 — без ограничения.
+    pub upload_quota_bytes: u64,
 }
 
 impl Config {
@@ -87,12 +94,29 @@ impl Config {
             );
         }
 
+        // Общая квота защищает диск: без неё папка вложений растёт, пока не
+        // закончится место. Ноль означает «без ограничения».
+        let upload_quota_mb = match env::var("CHAT_UPLOAD_QUOTA_MB") {
+            Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                format!("CHAT_UPLOAD_QUOTA_MB должен быть целым числом (получено `{raw}`)")
+            })?,
+            Err(_) => DEFAULT_UPLOAD_QUOTA_MB,
+        };
+
+        if upload_quota_mb > MAX_UPLOAD_QUOTA_MB {
+            return Err(format!(
+                "CHAT_UPLOAD_QUOTA_MB должен быть от 0 до {MAX_UPLOAD_QUOTA_MB} (0 — без ограничения)"
+            )
+            .into());
+        }
+
         Ok(Self {
             bind_addr,
             db_url,
             db_pool,
             upload_dir,
             max_upload_bytes: max_upload_mb * 1024 * 1024,
+            upload_quota_bytes: upload_quota_mb * 1024 * 1024,
         })
     }
 }
